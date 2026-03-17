@@ -178,8 +178,7 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
-    await upload_file(client, _up_dummy, result)
-    cleanup(tmp)
+    asyncio.get_event_loop().create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -262,15 +261,32 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         else:
             url2   = url
             fmt_id = raw or None
-        await _launch_download(client, cb.message, url2, uid, fmt_id=fmt_id)
         _cache.pop(token, None)
+        asyncio.get_event_loop().create_task(
+            _launch_download(client, cb.message, url2, uid, fmt_id=fmt_id)
+        )
         return
 
     # ── Standard download ─────────────────────────────────────
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
-        await _launch_download(client, cb.message, url, uid, audio_only=audio_only)
         _cache.pop(token, None)
+        asyncio.get_event_loop().create_task(
+            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Upload helper — runs as independent task
+# ─────────────────────────────────────────────────────────────
+
+async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
+    try:
+        await upload_file(client, msg, path)
+    except Exception as exc:
+        log.error("Upload failed for %s: %s", path, exc)
+    finally:
+        cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -340,15 +356,15 @@ async def _launch_download(
             pass
         return
 
-    # No "Uploading…" message — panel tracks it silently
+    # No status message — fire upload as its own independent task
+    # so it runs concurrently with other uploads
     from types import SimpleNamespace
     _up_dummy = SimpleNamespace(
         edit=lambda *a, **kw: asyncio.sleep(0),
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
-    await upload_file(client, _up_dummy, path)
-    cleanup(tmp)
+    asyncio.get_event_loop().create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
