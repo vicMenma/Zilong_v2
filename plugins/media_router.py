@@ -2,8 +2,8 @@
 plugins/media_router.py
 Receives every file/photo sent in private and dispatches cleanly.
 
-Change: calls runner.ensure_panel(uid, client, chat_id) so a unified
-progress panel is always spawned before any work begins.
+Change: removed runner.ensure_panel() call — panels are only shown on
+explicit /status command. All background progress is tracked silently.
 """
 import os
 import logging
@@ -34,10 +34,6 @@ async def media_router(client: Client, msg: Message):
         return
 
     await users.register(uid, msg.from_user.first_name or "")
-
-    # ── Spawn / refresh the unified panel for this user ───────
-    from services.task_runner import runner
-    await runner.ensure_panel(uid, client, msg.chat.id)
 
     # ── Check size limit ──────────────────────────────────────
     media = msg.video or msg.audio or msg.document
