@@ -1,0 +1,39 @@
+name: zilong-bot
+
+services:
+  - name: zilong
+    type: worker          # no public port needed for a bot
+    git:
+      repository: github.com/vicMenma/Zilong_multiusage
+      branch: main
+    build:
+      buildpack:
+        build_command: "pip install -r requirements.txt"
+        run_command: "python main.py"
+    env:
+      - key: API_ID
+        secret: API_ID          # store in Koyeb Secrets
+      - key: API_HASH
+        secret: API_HASH
+      - key: BOT_TOKEN
+        secret: BOT_TOKEN
+      - key: OWNER_ID
+        secret: OWNER_ID
+      - key: KOYEB
+        value: "1"
+      - key: PORT
+        value: "8000"
+      - key: FILE_LIMIT_MB
+        value: "2048"
+      - key: DOWNLOAD_DIR
+        value: "/tmp/zilong_dl"
+      - key: LOG_CHANNEL
+        value: "0"
+    health_checks:
+      - type: tcp
+        port: 8000
+    instance_types:
+      - type: nano           # cheapest — upgrade to micro if needed
+    scaling:
+      min: 1
+      max: 1
