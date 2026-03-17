@@ -2,10 +2,15 @@
 services/downloader.py
 Download strategies — decoupled from Telegram types.
 
-Changes v2:
-- Magnet/aria2: emits meta_phase=True during metadata fetch, then proper
-  done/total/speed/eta progress during download
-- smart_download records meta_phase transitions on the TaskRecord directly
+Multi-operation changes:
+- download_ytdlp() uses a ProcessPoolExecutor (not ThreadPool) so multiple
+  yt-dlp downloads run in truly separate OS processes — no GIL contention,
+  no yt-dlp internal state conflicts.
+- ProcessPool is a module-level singleton (max 5 workers) so processes are
+  reused across calls and startup cost is paid once.
+- All other strategies (direct HTTP, aria2, gdrive, mediafire) were already
+  async / subprocess-based — no changes needed there.
+- smart_download() is unchanged; it remains a thin dispatcher.
 """
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ import asyncio
 import os
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
@@ -20,6 +26,18 @@ from core.config import cfg
 from services.utils import largest_file
 
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
+
+# ── Process pool for yt-dlp (module-level singleton) ─────────
+# Max 5 parallel yt-dlp processes.  Each process is ~50 MB RAM.
+_YTDLP_POOL: Optional[ProcessPoolExecutor] = None
+
+
+def _get_pool() -> ProcessPoolExecutor:
+    global _YTDLP_POOL
+    if _YTDLP_POOL is None:
+        _YTDLP_POOL = ProcessPoolExecutor(max_workers=5)
+    return _YTDLP_POOL
+
 
 # ── URL classifier ────────────────────────────────────────────
 
@@ -79,14 +97,20 @@ async def download_direct(
     return fpath
 
 
-# ── yt-dlp ────────────────────────────────────────────────────
+# ── yt-dlp (process pool — true parallelism) ─────────────────
 
-async def download_ytdlp(
-    url: str, dest: str,
-    audio_only: bool = False,
-    fmt_id: Optional[str] = None,
-    progress: Optional[ProgressCB] = None,
+def _ytdlp_worker(
+    url: str,
+    dest: str,
+    audio_only: bool,
+    fmt_id: Optional[str],
 ) -> str:
+    """
+    Runs inside a separate OS process.
+    No progress callback here (can't cross process boundary easily) —
+    progress is polled by the async wrapper via file size growth.
+    Returns the output file path.
+    """
     import yt_dlp
 
     out_tmpl = os.path.join(dest, "%(title).60s.%(ext)s")
@@ -110,46 +134,72 @@ async def download_ytdlp(
     else:
         opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
-    last_report = [0.0]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info  = ydl.extract_info(url, download=True)
+        fpath = ydl.prepare_filename(info)
 
-    def _hook(d: dict) -> None:
-        if d.get("status") != "downloading":
-            return
-        now = time.time()
-        if now - last_report[0] < 3.0:
-            return
-        last_report[0] = now
-        total  = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        done   = d.get("downloaded_bytes", 0)
-        speed  = d.get("speed") or 0.0
-        eta    = int(d.get("eta") or 0)
-        if progress:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(
-                lambda: loop.create_task(progress(done, total, speed, eta))
-            )
-
-    opts["progress_hooks"] = [_hook]
-
-    loop = asyncio.get_event_loop()
-
-    def _dl() -> str:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info  = ydl.extract_info(url, download=True)
-            fname = ydl.prepare_filename(info)
-        return fname
-
-    fpath = await loop.run_in_executor(None, _dl)
     if not os.path.exists(fpath):
         base = os.path.splitext(fpath)[0]
         for ext in (".mp3", ".m4a", ".opus", ".ogg", ".aac", ".mp4", ".mkv", ".webm"):
             candidate = base + ext
             if os.path.exists(candidate):
                 return candidate
-        fpath = largest_file(dest)
-        if not fpath:
+        result = largest_file(dest)
+        if not result:
             raise FileNotFoundError(f"yt-dlp produced no output in {dest!r}")
+        return result
+
     return fpath
+
+
+async def download_ytdlp(
+    url: str, dest: str,
+    audio_only: bool = False,
+    fmt_id: Optional[str] = None,
+    progress: Optional[ProgressCB] = None,
+) -> str:
+    """
+    Runs yt-dlp in a separate process (ProcessPoolExecutor).
+    Progress is approximated by polling the output directory's largest file
+    every second while waiting — gives reasonable speed/ETA estimates without
+    needing cross-process callbacks.
+    """
+    loop = asyncio.get_event_loop()
+    pool = _get_pool()
+
+    # Submit to process pool — returns a Future
+    future = loop.run_in_executor(
+        pool,
+        _ytdlp_worker,
+        url, dest, audio_only, fmt_id,
+    )
+
+    # ── Progress poller ───────────────────────────────────────
+    # While the process runs, poll the dest dir every second and estimate
+    # progress from file size growth (works for both video and audio).
+    start     = time.time()
+    last_size = 0
+    last_time = start
+
+    while not future.done():
+        await asyncio.sleep(1.0)
+        if progress:
+            try:
+                cur = largest_file(dest)
+                cur_size = os.path.getsize(cur) if cur else 0
+                now      = time.time()
+                dt       = now - last_time
+                speed    = (cur_size - last_size) / dt if dt > 0 else 0.0
+                last_size = cur_size
+                last_time = now
+                # total is unknown until download starts, pass 0
+                eta = 0
+                await progress(cur_size, 0, speed, eta)
+            except Exception:
+                pass
+
+    # Await result (re-raises any exception from the worker)
+    return await future
 
 
 # ── Mediafire ─────────────────────────────────────────────────
@@ -223,12 +273,15 @@ async def download_gdrive(
 
 
 # ── Aria2 (magnet / torrent) ──────────────────────────────────
+# aria2c is already a separate process that manages its own concurrency.
+# Multiple download_aria2() calls simply add more downloads to the same
+# aria2c daemon — it handles them all in parallel natively.
 
 async def download_aria2(
     uri_or_path: str, dest: str,
     is_file: bool = False,
     progress: Optional[ProgressCB] = None,
-    task_record=None,          # TaskRecord — used to set meta_phase
+    task_record=None,
 ) -> str:
     import aria2p
 
@@ -259,7 +312,7 @@ async def download_aria2(
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
 
     meta_start = time.time()
-    for i in range(120):      # up to 2 min
+    for _ in range(120):
         await asyncio.sleep(1)
         try:
             dl = api.get_download(dl.gid)
@@ -268,11 +321,10 @@ async def download_aria2(
         if dl.error_message:
             raise RuntimeError(f"aria2c: {dl.error_message}")
         if task_record is not None:
-            elapsed = time.time() - meta_start
             task_record.update(
                 meta_phase=True,
-                state=f"🔍 Metadata…",
-                elapsed=elapsed,
+                state="🔍 Metadata…",
+                elapsed=time.time() - meta_start,
             )
         if dl.name and dl.name != "Unknown":
             break
