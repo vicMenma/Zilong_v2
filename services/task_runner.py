@@ -142,8 +142,10 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
-        # Wake any open /status panel for this user
-        runner._wake_panel(record.user_id)
+        # Auto-open panel for this user if none is alive, else just wake it
+        asyncio.get_event_loop().create_task(
+            runner.auto_panel(record.user_id)
+        )
 
     async def update(self, tid: str, **kw) -> None:
         async with self._lock:
@@ -475,14 +477,42 @@ class TaskRunner:
         new_panel.start()
 
     async def ensure_panel(self, uid: int, client, chat_id: int) -> None:
+        """Wake an existing panel if open. Does not auto-send. Used by media_router."""
+        async with self._panel_lock(uid):
+            panel = self._panels.get(uid)
+            if panel and not panel._stopped:
+                panel.wake()
+
+    async def auto_panel(self, uid: int) -> None:
         """
-        Only opens a panel if the user already has one open (i.e. they ran /status).
-        Does NOT auto-send a new panel message — that is done only by /status.
+        Called automatically on every new task registration.
+        - If a panel is already alive for this user → just wake it (no new message).
+        - If no panel exists → send a new panel message to the user's private chat
+          and start the live loop.
+        Race-safe via per-user lock.
         """
         async with self._panel_lock(uid):
             panel = self._panels.get(uid)
             if panel and not panel._stopped:
                 panel.wake()
+                return
+            if panel:
+                panel.stop()
+            # Need the Pyrogram client to send the message
+            try:
+                from core.session import get_client
+                from pyrogram import enums
+                client = get_client()
+                msg = await client.send_message(
+                    uid,
+                    "⚡ <b>ZILONG</b>  <code>Starting…</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                new_panel = LivePanel(msg, uid=uid)
+                self._panels[uid] = new_panel
+                new_panel.start()
+            except Exception as exc:
+                log.debug("auto_panel uid=%d: %s", uid, exc)
 
     def close_panel(self, uid: int) -> None:
         p = self._panels.pop(uid, None)
