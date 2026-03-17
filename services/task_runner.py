@@ -2,14 +2,14 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-Changes v2:
-- MAX_WORKERS bumped to 10 (up from 4)
-- Panel is auto-sent to the user's chat on first task — no /status needed
-- Tasks are numbered (#1, #2 …) for easy reference
-- Magnet/torrent: dedicated metadata-fetch phase shown clearly in panel
-- Panel layout: compact header | numbered active tasks | recent finished | sysbar
-- runner.ensure_panel() still available for explicit /status calls
-- EDIT_INTERVAL kept at 1.5 s; rate-limit guard kept at 1 s
+Changes:
+- Panel is ONLY shown when user calls /status (or /stats for admin)
+  No auto-spawn on file receipt or download start
+- ensure_panel() is kept for /status but does NOT auto-send on task arrival
+- render_panel() redesigned: fully vertical layout, one stat per line,
+  no horizontal stat cramming
+- MAX_WORKERS kept at 10
+- EDIT_INTERVAL kept at 1.5 s
 """
 from __future__ import annotations
 
@@ -78,11 +78,9 @@ class TaskRecord:
     eta:      int   = 0
     elapsed:  float = 0.0
     seeds:    int   = 0
-    # magnet metadata phase
     meta_phase: bool = False
     started:  float = field(default_factory=time.time)
     finished: Optional[float] = None
-    # sequence number assigned by tracker (for display)
     seq:      int   = 0
 
     _factory: Optional[Callable] = field(default=None, repr=False, compare=False)
@@ -144,6 +142,7 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
+        # Wake any open /status panel for this user
         runner._wake_panel(record.user_id)
 
     async def update(self, tid: str, **kw) -> None:
@@ -176,8 +175,8 @@ class GlobalTracker:
             tid for tid, t in self._tasks.items()
             if t.is_terminal and t.finished and now - t.finished > TASK_LINGER
         ]
-        for tid in dead:
-            self._tasks.pop(tid, None)
+        for k in dead:
+            self._tasks.pop(k, None)
 
     def _evict_sync(self) -> None:
         now  = time.time()
@@ -185,18 +184,18 @@ class GlobalTracker:
             tid for tid, t in self._tasks.items()
             if t.is_terminal and t.finished and now - t.finished > TASK_LINGER
         ]
-        for tid in dead:
-            self._tasks.pop(tid, None)
+        for k in dead:
+            self._tasks.pop(k, None)
 
 
 tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer
+# Panel renderer  (fully vertical layout)
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 12) -> str:
+def _bar(pct: float, w: int = 16) -> str:
     filled = int(min(max(pct, 0), 100) / 100 * w)
     return "█" * filled + "░" * (w - filled)
 
@@ -233,56 +232,77 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     lines += [
         f"⚡ <b>ZILONG</b>  <code>{summary}</code>",
-        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
-    # ── Active tasks ───────────────────────────────────────────
+    # ── Active tasks — fully vertical ─────────────────────────
     for t in active:
-        pct   = t.pct()
-        bar   = _bar(pct, 12)
-        spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
-        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
-        el_s  = human_dur(int(t.elapsed)) if t.elapsed else "0s"
-        fname = (t.fname[:36] + "…") if len(t.fname) > 36 else t.fname
+        pct = t.pct()
+        bar = _bar(pct)
 
-        # Magnet metadata phase — special display
+        lines.append("")
+
+        # Task header line
+        lines.append(f"#{t.seq}  {t.mode_icon} <b>{t.label}</b>")
+
+        # Filename (if available and different from label)
+        if t.fname and t.fname != t.label:
+            short = (t.fname[:48] + "…") if len(t.fname) > 48 else t.fname
+            lines.append(f"   📄 <code>{short}</code>")
+
+        # Metadata fetch phase for magnets
         if t.meta_phase:
-            lines += [
-                "",
-                f"#{t.seq}  🧲 <b>{t.label}</b>",
-                f"   ⏳ <i>Fetching torrent metadata…</i>  🕰 <code>{el_s}</code>",
-            ]
+            el_s = human_dur(int(t.elapsed)) if t.elapsed else "0s"
+            lines.append(f"   ⏳ <i>Fetching torrent metadata…</i>")
+            lines.append(f"   🕰  <b>Elapsed</b>  <code>{el_s}</code>")
             continue
 
-        lines += ["", f"#{t.seq}  {t.mode_icon} <b>{t.label}</b>"]
-        if fname:
-            lines.append(f"   📄 <code>{fname}</code>")
-        lines += [
-            f"   <code>[{bar}]</code> <b>{pct:.1f}%</b>  {t.state}",
-            f"   {_spd_emoji(t.speed)} <code>{spd_s}</code>"
-            f"  {t.engine_icon} <code>{t.engine_lbl}</code>"
-            f"  ⏳ <code>{eta_s}</code>  🕰 <code>{el_s}</code>",
-        ]
+        # Progress bar + percentage
+        lines.append(f"   <code>[{bar}]</code> <b>{pct:.1f}%</b>")
+
+        # Status
+        lines.append(f"   📌 <b>Status</b>   <code>{t.state}</code>")
+
+        # Speed
+        spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
+        lines.append(f"   {_spd_emoji(t.speed)}  <b>Speed</b>    <code>{spd_s}</code>")
+
+        # Engine
+        lines.append(f"   {t.engine_icon}  <b>Engine</b>   <code>{t.engine_lbl}</code>")
+
+        # ETA
+        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
+        lines.append(f"   ⏳  <b>ETA</b>      <code>{eta_s}</code>")
+
+        # Elapsed
+        el_s = human_dur(int(t.elapsed)) if t.elapsed else "0s"
+        lines.append(f"   🕰  <b>Elapsed</b>  <code>{el_s}</code>")
+
+        # Bytes done / total
         if t.total:
-            done_s = human_size(t.done)
-            tot_s  = human_size(t.total)
-            lines.append(f"   ✅ <code>{done_s} / {tot_s}</code>")
+            lines.append(
+                f"   ✅  <b>Done</b>     <code>{human_size(t.done)} / {human_size(t.total)}</code>"
+            )
+        elif t.done:
+            lines.append(f"   ✅  <b>Done</b>     <code>{human_size(t.done)}</code>")
+
+        # Seeders (torrents)
         if t.seeds:
-            lines.append(f"   🌱 Seeders <code>{t.seeds}</code>")
+            lines.append(f"   🌱  <b>Seeders</b>  <code>{t.seeds}</code>")
 
     # ── Finished tasks ─────────────────────────────────────────
     if finished:
-        lines += ["", "─ <i>Recent</i> ───────────────────"]
+        lines += ["", "─ <i>Recent</i> ──────────────────────"]
         for t in finished:
-            fname = (t.fname[:32] + "…") if len(t.fname) > 32 else t.fname
+            fname = (t.fname[:36] + "…") if len(t.fname) > 36 else t.fname
+            name  = fname or t.label
             sz_s  = (human_size(t.done) if t.done else human_size(t.total)) if (t.done or t.total) else ""
             el_s  = human_dur(int(t.elapsed)) if t.elapsed else ""
-            name  = fname or t.label
             detail = f"  <code>{sz_s}</code>" if sz_s else ""
             timing = f"  <i>({el_s})</i>" if el_s else ""
             lines.append(f"#{t.seq}  {t.state}  <code>{name}</code>{detail}{timing}")
 
-    # ── System bar ─────────────────────────────────────────────
+    # ── System bar — each stat on its own line ─────────────────
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
     rp    = stats.get("ram_pct", 0.0)
@@ -295,18 +315,19 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     lines += [
         "",
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🖥 CPU {_ring(cpu)}<code>[{_bar(cpu,8)}]</code><b>{cpu:.0f}%</b>"
-        f"  💾 RAM {_ring(rp)}<code>[{_bar(rp,8)}]</code><b>{rp:.0f}%</b>",
-        f"💿 <code>{human_size(df)}</code> free"
-        f"  🌐 ⬇<code>{human_size(dl)}/s</code> ⬆<code>{human_size(ul)}/s</code>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🖥  <b>CPU</b>    {_ring(cpu)}<code>[{_bar(cpu, 10)}]</code> <b>{cpu:.0f}%</b>",
+        f"💾  <b>RAM</b>    {_ring(rp)}<code>[{_bar(rp, 10)}]</code> <b>{rp:.0f}%</b>",
+        f"💿  <b>Disk</b>   <code>{human_size(df)} free</code>",
+        f"⬇️  <b>Down</b>   <code>{human_size(dl)}/s</code>",
+        f"⬆️  <b>Up</b>     <code>{human_size(ul)}/s</code>",
     ]
 
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────
-# LivePanel — one per user
+# LivePanel — one per user, only created on /status
 # ─────────────────────────────────────────────────────────────
 
 class LivePanel:
@@ -390,7 +411,6 @@ class LivePanel:
         except Exception:
             pass
 
-        # Only remove ourselves — don't clobber a newer panel that may have replaced us
         if runner._panels.get(self._uid) is self:
             runner._panels.pop(self._uid, None)
 
@@ -440,16 +460,14 @@ class TaskRunner:
 
     def attach_panel(self, uid: int, msg) -> None:
         """
-        Attach an already-sent status message as the live panel.
-        Called right after the bot sends its first reply to an operation
-        (e.g. "📥 Starting download…"). No new message is ever sent.
-        If a panel already exists and is running, just wake it — don't replace it.
+        Attach an existing message as the live panel.
+        Only used for explicit /status calls or admin /stats.
+        If a panel is already alive, just wake it.
         """
         panel = self._panels.get(uid)
         if panel and not panel._stopped:
             panel.wake()
             return
-        # Stop any dead panel cleanly
         if panel:
             panel.stop()
         new_panel = LivePanel(msg, uid=uid)
@@ -458,29 +476,13 @@ class TaskRunner:
 
     async def ensure_panel(self, uid: int, client, chat_id: int) -> None:
         """
-        Fallback: only send a new panel message if there is NO active panel at all.
-        Used by media_router for file uploads where no status message exists yet.
-        Race-safe via per-user lock.
+        Only opens a panel if the user already has one open (i.e. they ran /status).
+        Does NOT auto-send a new panel message — that is done only by /status.
         """
         async with self._panel_lock(uid):
             panel = self._panels.get(uid)
             if panel and not panel._stopped:
                 panel.wake()
-                return
-            if panel:
-                panel.stop()
-            try:
-                from pyrogram import enums
-                msg = await client.send_message(
-                    chat_id,
-                    "⚡ <b>ZILONG</b>  <code>Starting…</code>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-                new_panel = LivePanel(msg, uid=uid)
-                self._panels[uid] = new_panel
-                new_panel.start()
-            except Exception as exc:
-                log.warning("ensure_panel uid=%d: %s", uid, exc)
 
     def close_panel(self, uid: int) -> None:
         p = self._panels.pop(uid, None)

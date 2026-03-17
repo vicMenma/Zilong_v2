@@ -1,10 +1,11 @@
 """
-plugins/url_handler.py
-Handles URL messages and torrent files.
+services/url_handler.py
+(Mirror of plugins/url_handler.py — see that file for full changelog)
 
-v2: _launch_download now calls runner.attach_panel(uid, st) so the
-"Starting download…" message becomes the unified live panel instead of
-writing its own inline progress_panel text. No more duplicate panels.
+Changes:
+- Removed "Stream Extractor" button from magnet/torrent and mediafire keyboards
+- _launch_download no longer attaches a live panel; progress tracked silently
+  via /status only
 """
 from __future__ import annotations
 
@@ -62,10 +63,6 @@ def _fmt_dur(s) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-# ─────────────────────────────────────────────────────────────
-# Keyboards
-# ─────────────────────────────────────────────────────────────
-
 def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
     rows: list = []
     if kind == "ytdlp":
@@ -78,9 +75,8 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
         ]
     elif kind in ("magnet", "torrent"):
         rows += [
-            [InlineKeyboardButton("🧲 Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
-            [InlineKeyboardButton("📊 Magnet Info",      callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🧲 Download",    callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📊 Magnet Info", callback_data=f"dl|info|{token}")],
         ]
     elif kind == "gdrive":
         rows += [
@@ -90,8 +86,7 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
         ]
     elif kind == "mediafire":
         rows += [
-            [InlineKeyboardButton("📁 Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
+            [InlineKeyboardButton("📁 Download", callback_data=f"dl|video|{token}")],
         ]
     else:
         rows += [
@@ -102,10 +97,6 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
     return InlineKeyboardMarkup(rows)
 
-
-# ─────────────────────────────────────────────────────────────
-# URL message handler
-# ─────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.private & filters.text, group=5)
 async def url_handler(client: Client, msg: Message):
@@ -137,21 +128,18 @@ async def url_handler(client: Client, msg: Message):
     )
 
 
-# ─────────────────────────────────────────────────────────────
-# Torrent file (from media_router)
-# ─────────────────────────────────────────────────────────────
-
 async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> None:
-    st  = await msg.reply("🌊 Torrent received. Starting aria2c…")
+    st  = await msg.reply(
+        "🌊 Torrent received. Starting aria2c…\n\n<i>Use /status to track progress.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
     tmp = make_tmp(cfg.download_dir, uid)
-    # Attach this message as the live panel immediately
-    from services.task_runner import runner
-    runner.attach_panel(uid, st)
     try:
         tp = await tg_download(
             client, media.file_id,
             os.path.join(tmp, "dl.torrent"), st,
             fname="dl.torrent",
+            user_id=uid,
         )
         from services.downloader import download_aria2
         result = await download_aria2(tp, tmp, is_file=True)
@@ -162,10 +150,6 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
     await upload_file(client, st, result)
     cleanup(tmp)
 
-
-# ─────────────────────────────────────────────────────────────
-# Download callback
-# ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^dl\|"))
 async def dl_cb(client: Client, cb: CallbackQuery):
@@ -188,7 +172,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
 
-    # ── Thumbnail ─────────────────────────────────────────────
     if mode == "thumb":
         st = await cb.message.edit("🖼️ Fetching thumbnail…")
         try:
@@ -210,7 +193,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         _cache.pop(token, None)
         return
 
-    # ── Info ──────────────────────────────────────────────────
     if mode == "info":
         kind_i = classify(url)
         if kind_i in ("magnet", "torrent"):
@@ -221,7 +203,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             await _handle_info(client, cb, url, token)
         return
 
-    # ── Stream selector ───────────────────────────────────────
     if mode == "stream":
         kind_s = classify(url)
         if kind_s in ("magnet", "torrent"):
@@ -234,7 +215,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             await extract_url_streams(client, st, url, uid, edit=False)
         return
 
-    # ── Stream download (specific format ID) ─────────────────
     if mode == "stream_dl":
         raw = _get(token)
         if "|||" in raw:
@@ -246,16 +226,11 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         _cache.pop(token, None)
         return
 
-    # ── Standard download ─────────────────────────────────────
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
         await _launch_download(client, cb.message, url, uid, audio_only=audio_only)
         _cache.pop(token, None)
 
-
-# ─────────────────────────────────────────────────────────────
-# Download launcher — attaches panel instead of writing inline progress
-# ─────────────────────────────────────────────────────────────
 
 async def _launch_download(
     client: Client,
@@ -265,15 +240,12 @@ async def _launch_download(
     audio_only: bool = False,
     fmt_id: str | None = None,
 ) -> None:
-    from services.task_runner import runner
-
     tmp = make_tmp(cfg.download_dir, uid)
-    st  = await safe_edit(panel_msg, "📥 Starting download…") or panel_msg
-
-    # ── Key change: attach this message as the unified panel ──
-    # All progress updates will now go through the panel loop
-    # editing THIS message. No second panel message is ever sent.
-    runner.attach_panel(uid, st)
+    st = await safe_edit(
+        panel_msg,
+        "📥 <b>Download started</b>\n\n<i>Use /status to track progress.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    ) or panel_msg
 
     try:
         path = await smart_download(
@@ -310,10 +282,6 @@ async def _launch_download(
     await upload_file(client, st, path)
     cleanup(tmp)
 
-
-# ─────────────────────────────────────────────────────────────
-# Info handler
-# ─────────────────────────────────────────────────────────────
 
 async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
     st   = await cb.message.edit("📊 Fetching info…")
@@ -385,7 +353,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             parse_mode=enums.ParseMode.HTML)
         return
 
-    # Direct link — probe first 5MB
     try:
         import aiohttp
         import tempfile
