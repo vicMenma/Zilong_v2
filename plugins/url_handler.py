@@ -172,9 +172,13 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         except Exception:
             pass
         return
-    from core.session import get_client
-    st = await get_client().send_message(uid, "📤 Uploading…", parse_mode=enums.ParseMode.HTML)
-    await upload_file(client, st, result)
+    from types import SimpleNamespace
+    _up_dummy = SimpleNamespace(
+        edit=lambda *a, **kw: asyncio.sleep(0),
+        delete=lambda: asyncio.sleep(0),
+        chat=SimpleNamespace(id=uid),
+    )
+    await upload_file(client, _up_dummy, result)
     cleanup(tmp)
 
 
@@ -336,13 +340,14 @@ async def _launch_download(
             pass
         return
 
-    # For upload we need a status message — send a minimal one
-    from core.session import get_client
-    from pyrogram import enums
-    st = await get_client().send_message(
-        uid, "📤 Uploading…", parse_mode=enums.ParseMode.HTML,
+    # No "Uploading…" message — panel tracks it silently
+    from types import SimpleNamespace
+    _up_dummy = SimpleNamespace(
+        edit=lambda *a, **kw: asyncio.sleep(0),
+        delete=lambda: asyncio.sleep(0),
+        chat=SimpleNamespace(id=uid),
     )
-    await upload_file(client, st, path)
+    await upload_file(client, _up_dummy, path)
     cleanup(tmp)
 
 
