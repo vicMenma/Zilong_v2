@@ -1,6 +1,12 @@
 """
 plugins/url_handler.py
 Handles URL messages and torrent files.
+
+Changes:
+- Removed "Stream Extractor" button from magnet/torrent keyboards
+- Removed "Stream Extractor" button from mediafire keyboard (only download)
+- _launch_download no longer attaches a live panel; progress is silent
+  and only visible via /status
 """
 from __future__ import annotations
 
@@ -73,10 +79,10 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🖼️ Thumbnail",         callback_data=f"dl|thumb|{token}")],
         ]
     elif kind in ("magnet", "torrent"):
+        # No stream extractor — magnets are containers, not streamable media
         rows += [
-            [InlineKeyboardButton("🧲 Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
-            [InlineKeyboardButton("📊 Magnet Info",      callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🧲 Download",    callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📊 Magnet Info", callback_data=f"dl|info|{token}")],
         ]
     elif kind == "gdrive":
         rows += [
@@ -86,8 +92,7 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
         ]
     elif kind == "mediafire":
         rows += [
-            [InlineKeyboardButton("📁 Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
+            [InlineKeyboardButton("📁 Download", callback_data=f"dl|video|{token}")],
         ]
     else:
         rows += [
@@ -138,13 +143,15 @@ async def url_handler(client: Client, msg: Message):
 # ─────────────────────────────────────────────────────────────
 
 async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> None:
-    st  = await msg.reply("🌊 Torrent received. Starting aria2c…")
+    st  = await msg.reply("🌊 Torrent received. Starting aria2c…\n\n<i>Use /status to track progress.</i>",
+                          parse_mode=enums.ParseMode.HTML)
     tmp = make_tmp(cfg.download_dir, uid)
     try:
         tp = await tg_download(
             client, media.file_id,
             os.path.join(tmp, "dl.torrent"), st,
             fname="dl.torrent",
+            user_id=uid,
         )
         from services.downloader import download_aria2
         result = await download_aria2(tp, tmp, is_file=True)
@@ -218,6 +225,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     if mode == "stream":
         kind_s = classify(url)
         if kind_s in ("magnet", "torrent"):
+            # Should not be reachable from new keyboard, but kept as safety
             from plugins.stream_extractor import extract_magnet_streams
             st = await cb.message.edit("🧲 Fetching torrent file list…")
             await extract_magnet_streams(client, st, url, uid)
@@ -229,7 +237,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
     # ── Stream download (specific format ID) ─────────────────
     if mode == "stream_dl":
-        # token here is a combined token: look it up and split
         raw = _get(token)
         if "|||" in raw:
             url2, fmt_id = raw.split("|||", 1)
@@ -248,7 +255,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Download launcher
+# Download launcher — silent progress, visible only via /status
 # ─────────────────────────────────────────────────────────────
 
 async def _launch_download(
@@ -259,43 +266,19 @@ async def _launch_download(
     audio_only: bool = False,
     fmt_id: str | None = None,
 ) -> None:
-    tmp   = make_tmp(cfg.download_dir, uid)
-    st    = panel_msg
-    start = time.time()
-    last  = [start]
-
-    async def _progress(done: int, total: int, speed: float, eta: int) -> None:
-        from services.utils import progress_panel
-        now = time.time()
-        if now - last[0] < 3.0:
-            return
-        last[0] = now
-        # done=0 total=0 is the metadata-fetch heartbeat from aria2
-        if done == 0 and total == 0:
-            elapsed = int(now - start)
-            await safe_edit(
-                st,
-                f"🧲 <b>Fetching torrent metadata…</b>\n"
-                f"⏳ <code>{elapsed}s elapsed</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-            return
-        panel = progress_panel(
-            mode="dl", done=done, total=total,
-            speed=speed, eta=eta,
-            elapsed=now - start,
-            engine=classify(url),
-        )
-        await safe_edit(st, panel, parse_mode=enums.ParseMode.HTML)
-
-    await safe_edit(st, "📥 Starting download…")
+    tmp = make_tmp(cfg.download_dir, uid)
+    # Edit the action message to a simple "started" notice — no live panel here
+    st = await safe_edit(
+        panel_msg,
+        "📥 <b>Download started</b>\n\n<i>Use /status to track progress.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    ) or panel_msg
 
     try:
         path = await smart_download(
             url, tmp,
             audio_only=audio_only,
             fmt_id=fmt_id,
-            progress=_progress,
             user_id=uid,
         )
     except Exception as exc:
