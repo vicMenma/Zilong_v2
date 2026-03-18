@@ -23,7 +23,7 @@ MAX_WORKERS    = 10
 MAX_CONCURRENT = 5          # hard parallel task cap
 EDIT_INTERVAL  = 1.5
 PANEL_TTL      = 600
-TASK_LINGER    = 30
+TASK_LINGER    = 3    # finished tasks evicted after 3s — panel deletes before this anyway
 
 # Global semaphore — limits truly concurrent task execution to 5
 _task_semaphore: Optional[asyncio.Semaphore] = None
@@ -223,15 +223,12 @@ tracker = GlobalTracker()
 # Panel renderer  — redesigned card-style layout
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 12) -> str:
+def _bar(pct: float, w: int = 18) -> str:
+    """Block-fill bar: ██████████░░░░░░░░ 57%"""
     pct    = min(max(pct, 0), 100)
     filled = int(pct / 100 * w)
     empty  = w - filled
-    if filled == 0:
-        return "○" * w
-    if filled == w:
-        return "●" * w
-    return "●" * filled + "○" * empty
+    return "█" * filled + "░" * empty
 
 
 def _spd_icon(bps: float) -> str:
@@ -246,6 +243,12 @@ def _ring(p: float) -> str:
     return "🟢" if p < 50 else ("🟡" if p < 80 else "🔴")
 
 
+_PANEL_HEADER = (
+    "⚡ <b>ZILONG MULTIUSAGE BOT</b>\n"
+    "——————————————————————"
+)
+
+
 async def render_panel(target_uid: Optional[int] = None) -> str:
     from services.utils import human_size, human_dur, system_stats
 
@@ -254,25 +257,23 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     finished = [t for t in tasks if t.is_terminal]
     now      = time.time()
 
-    n_active  = len(active)
     # Only dl/proc/magnet tasks consume semaphore slots
     n_queued  = sum(1 for t in active if t.state == "⏳ Queued" and t.mode in ("dl","proc","magnet"))
-    n_running = sum(1 for t in active if t.mode in ("dl","proc","magnet") and not t.state == "⏳ Queued")
+    n_running = sum(1 for t in active if t.mode in ("dl","proc","magnet") and t.state != "⏳ Queued")
     n_uploads = sum(1 for t in active if t.mode == "ul")
 
-    lines: list[str] = []
+    lines: list[str] = [_PANEL_HEADER, ""]
 
     # ── Active tasks ──────────────────────────────────────────
     for t in active:
         pct     = t.pct()
-        bar     = _bar(pct, 12)
+        bar     = _bar(pct, 18)
         elapsed = human_dur(int(t.elapsed)) if t.elapsed else "0s"
-        fname   = (t.fname or t.label)
-        fname_s = (fname[:45] + "…") if len(fname) > 45 else fname
 
-        # Mode header line  e.g.  📥 Download:  EyDxIZgtCZ
-        header_name = fname_s if fname_s else t.label
-        lines.append(f"{t.mode_icon} <b>{t.mode_lbl}:</b> <code>{header_name}</code>")
+        # File name line — always show just the filename with a folder icon
+        fname   = (t.fname or t.label)
+        fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
+        lines.append(f"📁 <code>{fname_s}</code>")
 
         if t.state == "⏳ Queued" and t.mode in ("dl", "proc", "magnet"):
             lines += [
@@ -289,8 +290,8 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             ]
             continue
 
-        # Progress bar
-        lines.append(f"<code>[{bar}]</code> <b>{pct:.1f}%</b>")
+        # Progress bar  ██████░░░░░░ 57%
+        lines.append(f"<code>{bar}</code> <b>{pct:.1f}%</b>")
 
         # Speed
         spd_s = (human_size(t.speed) + "/s") if t.speed else "0 B/s"
@@ -306,31 +307,12 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         eta_s = human_dur(t.eta) if t.eta > 0 else "-"
         lines.append(f"⏳ <b>ETA:</b> {eta_s} | <b>Elapsed:</b> {elapsed}")
 
-        # Engine
-        lines.append(f"⚙️ <b>Engine:</b> {t.engine_lbl}")
+        # Engine | Mode
+        lines.append(f"⚙️ <b>Engine:</b> {t.engine_lbl} | <b>Mode:</b> #{t.mode_lbl}")
 
         if t.seeds:
             lines.append(f"🌱 <b>Seeds:</b> {t.seeds}")
 
-        lines.append("")
-
-    # ── Separator between tasks and recent ────────────────────
-    if active and finished:
-        lines.append("—" * 18)
-
-    # ── Finished tasks ─────────────────────────────────────────
-    if finished:
-        for t in finished:
-            age_s  = human_dur(int(now - (t.finished or now)))
-            fname  = (t.fname or t.label)
-            short  = (fname[:38] + "…") if len(fname) > 38 else fname
-            sz_s   = human_size(t.done or t.total) if (t.done or t.total) else ""
-            el_s   = human_dur(int(t.elapsed)) if t.elapsed else ""
-            detail = f"  {sz_s}" if sz_s else ""
-            timing = f"  <i>{el_s}</i>" if el_s else ""
-            lines.append(
-                f"{t.state} {t.mode_icon} <code>{short}</code>{detail}{timing}  <i>({age_s} ago)</i>"
-            )
         lines.append("")
 
     # ── System stats + slot info ───────────────────────────────
@@ -341,10 +323,13 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     dl    = stats.get("dl_speed", 0.0)
     ul    = stats.get("ul_speed", 0.0)
 
+    slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
+    ul_tag  = f" · 📤 {n_uploads} uploading" if n_uploads else ""
+
     lines += [
-        "—" * 18,
+        "——————————————————————",
         f"🖥 <b>CPU:</b> {cpu:.1f}% | 💿 <b>FREE:</b> {human_size(df)}",
-        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}" + (f" · 📤 {n_uploads} uploading" if n_uploads else ""),
+        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {slots_s}{ul_tag}",
         f"⬇️ <b>DL:</b> {human_size(dl)}/s | ⬆️ <b>UL:</b> {human_size(ul)}/s",
     ]
 
@@ -414,26 +399,23 @@ class LivePanel:
             if since_last < 1.0:
                 await asyncio.sleep(1.0 - since_last)
 
+            # If all tasks for this user are terminal, delete the panel and exit
+            tasks = tracker.tasks_for_user(self._uid)
+            all_done = tasks and all(t.is_terminal for t in tasks)
+            if all_done:
+                try:
+                    await self._msg.delete()
+                except Exception:
+                    pass
+                self._stopped = True
+                break
+
             await self._edit()
 
             if self.is_idle():
                 log.debug("LivePanel uid=%d idle TTL — stopping", self._uid)
                 self._stopped = True
                 break
-
-        try:
-            tasks = tracker.tasks_for_user(self._uid)
-            if tasks:
-                from services.utils import safe_edit
-                from pyrogram import enums
-                text = await render_panel(self._uid)
-                await safe_edit(
-                    self._msg,
-                    text + "\n\n<i>⏱ Panel closed. /status to reopen.</i>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-        except Exception:
-            pass
 
         if runner._panels.get(self._uid) is self:
             runner._panels.pop(self._uid, None)
@@ -514,9 +496,11 @@ class TaskRunner:
                 from core.session import get_client
                 from pyrogram import enums
                 client = get_client()
+                # Render the real panel immediately — no placeholder
+                initial_text = await render_panel(uid)
                 msg = await client.send_message(
                     uid,
-                    "⚡ <b>ZILONG BOT</b>  <code>Loading…</code>",
+                    initial_text,
                     parse_mode=enums.ParseMode.HTML,
                 )
                 new_panel = LivePanel(msg, uid=uid)
