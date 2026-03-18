@@ -3,8 +3,9 @@ plugins/url_handler.py
 Handles URL messages and torrent files.
 
 Changes:
-- Removed "Stream Extractor" button from magnet/torrent keyboards
-- Removed "Stream Extractor" button from mediafire keyboard (only download)
+- Added "📊 Media Info" and "📡 Stream Extractor" buttons for magnets
+- Magnet Media Info: downloads torrent, probes the largest file, shows streams
+- Magnet Stream Extractor: lets user pick and extract a specific stream track
 - _launch_download no longer attaches a live panel; progress is silent
   and only visible via /status
 """
@@ -35,6 +36,9 @@ URL_RE = re.compile(r"https?://\S+|magnet:\?\S+", re.I)
 
 _cache: dict[str, str] = {}
 _CACHE_MAX = 500
+
+# Store magnet probe sessions: tok → {"path": str, "tmp": str, "streams": dict}
+_magnet_probe: dict[str, dict] = {}
 
 
 def _store(url: str) -> str:
@@ -79,10 +83,10 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🖼️ Thumbnail",         callback_data=f"dl|thumb|{token}")],
         ]
     elif kind in ("magnet", "torrent"):
-        # No stream extractor — magnets are containers, not streamable media
         rows += [
-            [InlineKeyboardButton("🧲 Download",    callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📊 Magnet Info", callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🧲 Download",         callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|magnet_stream|{token}")],
         ]
     elif kind == "gdrive":
         rows += [
@@ -148,7 +152,6 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
     except Exception:
         pass
     tmp = make_tmp(cfg.download_dir, uid)
-    # Use a dummy status object — panel auto-appears via tracker.register()
     from types import SimpleNamespace
     _dummy = SimpleNamespace(edit=lambda *a, **kw: asyncio.sleep(0),
                              delete=lambda: asyncio.sleep(0))
@@ -179,6 +182,230 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         chat=SimpleNamespace(id=uid),
     )
     asyncio.get_event_loop().create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
+
+
+# ─────────────────────────────────────────────────────────────
+# Magnet: probe the file content via aria2c metadata fetch
+# ─────────────────────────────────────────────────────────────
+
+async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str | None, dict]:
+    """
+    Downloads just enough of a magnet torrent (largest file) to probe its streams.
+    Returns (file_path, tmp_dir, stream_data). On failure returns (None, tmp, {}).
+    """
+    from services import ffmpeg as FF
+    import aria2p
+
+    tmp = make_tmp(cfg.download_dir, uid)
+    await safe_edit(st,
+        "🧲 <b>Magnet Probe</b>\n\n"
+        "<i>Fetching torrent metadata via aria2c…</i>\n"
+        "<i>This may take up to 60 seconds.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    try:
+        api = aria2p.API(aria2p.Client(
+            host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret,
+        ))
+    except Exception as exc:
+        await safe_edit(st,
+            f"❌ Cannot connect to aria2c: <code>{exc}</code>\n"
+            "<i>aria2c must be running for magnet probing.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        cleanup(tmp)
+        return None, None, {}
+
+    opts = {
+        "dir":              tmp,
+        "seed-time":        "0",
+        "bt-metadata-only": "true",
+        "follow-torrent":   "mem",
+        "pause-metadata":   "true",
+    }
+
+    try:
+        dl = api.add_magnet(magnet, options=opts)
+    except Exception as exc:
+        await safe_edit(st, f"❌ aria2c add failed: <code>{exc}</code>",
+                        parse_mode=enums.ParseMode.HTML)
+        cleanup(tmp)
+        return None, None, {}
+
+    # Wait for metadata
+    torrent_name = ""
+    file_list: list[dict] = []
+    t_start = time.time()
+
+    for _ in range(90):
+        await asyncio.sleep(1)
+        try:
+            dl = api.get_download(dl.gid)
+        except Exception:
+            continue
+        if dl.error_message:
+            break
+        if dl.name and dl.name != "Unknown":
+            torrent_name = dl.name
+            try:
+                for f in (dl.files or []):
+                    file_list.append({
+                        "index": f.index,
+                        "path":  f.path or "",
+                        "size":  f.length or 0,
+                    })
+            except Exception:
+                pass
+            break
+        if time.time() - t_start > 60:
+            break
+
+    # Remove the metadata-only download
+    try:
+        api.remove([dl])
+    except Exception:
+        pass
+
+    if not file_list:
+        await safe_edit(st,
+            "❌ <b>Could not fetch torrent file list.</b>\n\n"
+            "<i>aria2c could not resolve the magnet link metadata. "
+            "Try again with better tracker support, or check your aria2c connection.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        cleanup(tmp)
+        return None, None, {}
+
+    # Pick the largest video/audio file
+    _video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m2ts", ".wmv", ".m4v", ".rmvb", ".mpg", ".mpeg"}
+    _audio_exts = {".mp3", ".aac", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".wma", ".ac3", ".mka"}
+
+    def _priority(f: dict) -> int:
+        ext = os.path.splitext(f["path"])[1].lower()
+        if ext in _video_exts: return 2
+        if ext in _audio_exts: return 1
+        return 0
+
+    best = sorted(file_list, key=lambda f: (_priority(f), f["size"]), reverse=True)
+    if not best:
+        cleanup(tmp)
+        return None, None, {}
+
+    target_file = best[0]
+    fname       = os.path.basename(target_file["path"]) or f"file_{target_file['index']}"
+
+    await safe_edit(st,
+        f"🧲 <b>Metadata resolved!</b>\n\n"
+        f"📁 <code>{torrent_name[:50]}</code>\n"
+        f"🎯 Probing: <code>{fname[:48]}</code>\n\n"
+        f"⬇️ <i>Downloading file for stream analysis…</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    # Now download only the selected file index
+    dl_opts = {
+        "dir":           tmp,
+        "seed-time":     "0",
+        "select-file":   str(target_file["index"]),
+        "follow-torrent": "mem",
+        "max-connection-per-server": "16",
+        "split": "16",
+    }
+
+    try:
+        dl2 = api.add_magnet(magnet, options=dl_opts)
+    except Exception as exc:
+        await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
+                        parse_mode=enums.ParseMode.HTML)
+        cleanup(tmp)
+        return None, None, {}
+
+    t_start = time.time()
+    last_report = [time.time()]
+    PROBE_ENOUGH = 20 * 1024 * 1024  # probe after 20 MB
+
+    while True:
+        await asyncio.sleep(3)
+        try:
+            dl2 = api.get_download(dl2.gid)
+        except Exception:
+            await asyncio.sleep(5)
+            continue
+
+        if dl2.error_message:
+            try:
+                api.remove([dl2])
+            except Exception:
+                pass
+            await safe_edit(st, f"❌ Download error: <code>{dl2.error_message}</code>",
+                            parse_mode=enums.ParseMode.HTML)
+            cleanup(tmp)
+            return None, None, {}
+
+        done   = dl2.completed_length or 0
+        total  = dl2.total_length     or target_file["size"] or 0
+        speed  = dl2.download_speed   or 0
+
+        now = time.time()
+        if now - last_report[0] >= 5:
+            last_report[0] = now
+            spd_s = (human_size(speed) + "/s") if speed else "—"
+            pct   = f"{done/total*100:.1f}%" if total else f"{human_size(done)}"
+            await safe_edit(st,
+                f"⬇️ <b>Downloading for stream probe…</b>\n\n"
+                f"📄 <code>{fname[:48]}</code>\n"
+                f"📊 Progress: <code>{pct}</code>  🚀 Speed: <code>{spd_s}</code>\n\n"
+                f"<i>Will probe as soon as enough data is available.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+        if dl2.is_complete or done >= PROBE_ENOUGH:
+            # Pause the download — we have enough to probe
+            if not dl2.is_complete:
+                try:
+                    api.pause([dl2])
+                except Exception:
+                    pass
+            break
+
+        if time.time() - t_start > 600:
+            try:
+                api.remove([dl2])
+            except Exception:
+                pass
+            await safe_edit(st, "❌ Download timed out (10 min).",
+                            parse_mode=enums.ParseMode.HTML)
+            cleanup(tmp)
+            return None, None, {}
+
+    # Find the downloaded file
+    path = largest_file(tmp)
+    if not path:
+        cleanup(tmp)
+        await safe_edit(st, "❌ No file found after download.",
+                        parse_mode=enums.ParseMode.HTML)
+        return None, None, {}
+
+    # Clean up aria2 download
+    try:
+        api.remove([dl2])
+    except Exception:
+        pass
+
+    # Probe streams
+    await safe_edit(st, "🔍 <b>Probing streams…</b>", parse_mode=enums.ParseMode.HTML)
+    try:
+        sd, dur = await asyncio.gather(
+            FF.probe_streams(path),
+            FF.probe_duration(path),
+        )
+        return path, tmp, {"streams": sd, "duration": dur, "fname": fname}
+    except Exception as exc:
+        await safe_edit(st, f"❌ Stream probe failed: <code>{exc}</code>",
+                        parse_mode=enums.ParseMode.HTML)
+        cleanup(tmp)
+        return None, None, {}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -232,20 +459,34 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     if mode == "info":
         kind_i = classify(url)
         if kind_i in ("magnet", "torrent"):
-            from plugins.stream_extractor import extract_magnet_streams
-            st = await cb.message.edit("🧲 Fetching torrent info…")
-            await extract_magnet_streams(client, st, url, uid)
+            await _handle_magnet_info(client, cb, url, token)
         else:
             await _handle_info(client, cb, url, token)
         return
 
-    # ── Stream selector ───────────────────────────────────────
+    # ── Magnet Stream Extractor ───────────────────────────────
+    if mode == "magnet_stream":
+        st = await cb.message.edit("🧲 Preparing magnet stream extractor…")
+        path, tmp, probe = await _probe_magnet_file(url, uid, st)
+        if not path:
+            return
+        sd   = probe.get("streams", {})
+        dur  = probe.get("duration", 0)
+        fname = probe.get("fname", os.path.basename(path))
+
+        # Store session for stream extraction callbacks
+        sess_tok = hashlib.md5(path.encode()).hexdigest()[:10]
+        _magnet_probe[sess_tok] = {"path": path, "tmp": tmp, "streams": sd, "fname": fname}
+
+        await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
+        return
+
+    # ── Stream selector (non-magnet) ─────────────────────────
     if mode == "stream":
         kind_s = classify(url)
         if kind_s in ("magnet", "torrent"):
-            # Should not be reachable from new keyboard, but kept as safety
-            from plugins.stream_extractor import extract_magnet_streams
             st = await cb.message.edit("🧲 Fetching torrent file list…")
+            from plugins.stream_extractor import extract_magnet_streams
             await extract_magnet_streams(client, st, url, uid)
         else:
             from plugins.stream_extractor import extract_url_streams
@@ -277,6 +518,332 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
+# Magnet stream display + extraction
+# ─────────────────────────────────────────────────────────────
+
+_LANG_FLAG: dict[str, str] = {
+    "eng":"🇬🇧","en":"🇬🇧","jpn":"🇯🇵","ja":"🇯🇵",
+    "fra":"🇫🇷","fre":"🇫🇷","fr":"🇫🇷","deu":"🇩🇪","ger":"🇩🇪","de":"🇩🇪",
+    "spa":"🇪🇸","es":"🇪🇸","por":"🇧🇷","pt":"🇧🇷","ita":"🇮🇹","it":"🇮🇹",
+    "kor":"🇰🇷","ko":"🇰🇷","zho":"🇨🇳","zh":"🇨🇳","rus":"🇷🇺","ru":"🇷🇺",
+    "ara":"🇸🇦","ar":"🇸🇦","hin":"🇮🇳","hi":"🇮🇳","und":"🌐",
+}
+
+_LANG_NAME: dict[str, str] = {
+    "eng":"English","en":"English","jpn":"Japanese","ja":"Japanese",
+    "fra":"French","fre":"French","fr":"French","deu":"German","ger":"German","de":"German",
+    "spa":"Spanish","es":"Spanish","por":"Portuguese","pt":"Portuguese",
+    "ita":"Italian","it":"Italian","kor":"Korean","ko":"Korean",
+    "zho":"Chinese","zh":"Chinese","rus":"Russian","ru":"Russian",
+    "ara":"Arabic","ar":"Arabic","hin":"Hindi","hi":"Hindi","und":"Unknown",
+}
+
+
+def _flag(lang: str) -> str:
+    return _LANG_FLAG.get(lang.lower(), "🌐")
+
+
+def _lname(lang: str) -> str:
+    return _LANG_NAME.get(lang.lower(), lang.upper())
+
+
+async def _show_magnet_streams(
+    client: Client, st, sess_tok: str,
+    sd: dict, dur: int, fname: str, uid: int,
+) -> None:
+    from services.utils import human_size, fmt_hms
+
+    v_streams = sd.get("video",    [])
+    a_streams = sd.get("audio",    [])
+    s_streams = sd.get("subtitle", [])
+
+    lines = [
+        "📡 <b>Magnet Stream Extractor</b>",
+        f"📄 <code>{fname[:50]}</code>",
+        f"⏱ <code>{fmt_hms(dur)}</code>",
+        "──────────────────────",
+    ]
+
+    if v_streams:
+        lines.append(f"🎬 <b>Video</b>  ({len(v_streams)} track)")
+        for s in v_streams:
+            codec = s.get("codec_name","?").upper()
+            w, h  = s.get("width",0), s.get("height",0)
+            fr    = s.get("r_frame_rate","0/1")
+            try:
+                n2, d2 = fr.split("/")
+                fps = f"{float(n2)/max(float(d2),1):.0f}fps"
+            except Exception:
+                fps = ""
+            lines.append(f"  • <code>{codec}  {w}x{h}  {fps}</code>")
+
+    if a_streams:
+        lines.append(f"🎵 <b>Audio</b>  ({len(a_streams)} track{'s' if len(a_streams)>1 else ''})")
+        for s in a_streams:
+            codec = s.get("codec_name","?").upper()
+            tags  = s.get("tags",{}) or {}
+            lang  = (tags.get("language","und")).lower()
+            ch    = s.get("channels",0)
+            ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
+            lines.append(f"  • {_flag(lang)} <code>{codec}  {ch_s}</code>  {_lname(lang)}")
+
+    if s_streams:
+        lines.append(f"💬 <b>Subtitles</b>  ({len(s_streams)} track{'s' if len(s_streams)>1 else ''})")
+        for s in s_streams:
+            codec = s.get("codec_name","?").upper()
+            tags  = s.get("tags",{}) or {}
+            lang  = (tags.get("language","und")).lower()
+            lines.append(f"  • {_flag(lang)} <code>{codec}</code>  {_lname(lang)}")
+
+    if not any([v_streams, a_streams, s_streams]):
+        lines.append("⚠️ <i>No streams detected in this file.</i>")
+
+    lines += ["──────────────────────", "<i>Tap a stream to extract it:</i>"]
+
+    rows: list = []
+    for s in v_streams:
+        idx   = s.get("index", 0)
+        codec = s.get("codec_name","?").upper()
+        w, h  = s.get("width",0), s.get("height",0)
+        rows.append([InlineKeyboardButton(
+            f"🎬 Video #{idx}  {codec}  {w}x{h}",
+            callback_data=f"mse|v|{sess_tok}|{idx}|{uid}",
+        )])
+    for s in a_streams:
+        idx   = s.get("index", 0)
+        codec = s.get("codec_name","?").upper()
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        ch    = s.get("channels",0)
+        ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
+        rows.append([InlineKeyboardButton(
+            f"🎵 Audio #{idx}  {_flag(lang)}  {codec}  {ch_s}",
+            callback_data=f"mse|a|{sess_tok}|{idx}|{uid}",
+        )])
+    for s in s_streams:
+        idx   = s.get("index", 0)
+        codec = s.get("codec_name","?").upper()
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        rows.append([InlineKeyboardButton(
+            f"💬 Sub #{idx}  {_flag(lang)}  {_lname(lang)}  {codec}",
+            callback_data=f"mse|s|{sess_tok}|{idx}|{uid}",
+        )])
+
+    if len(a_streams) > 1:
+        rows.append([InlineKeyboardButton(
+            "🎵 Extract ALL audio tracks",
+            callback_data=f"mse|a_all|{sess_tok}|all|{uid}",
+        )])
+    if len(s_streams) > 1:
+        rows.append([InlineKeyboardButton(
+            "💬 Extract ALL subtitle tracks",
+            callback_data=f"mse|s_all|{sess_tok}|all|{uid}",
+        )])
+
+    rows.append([InlineKeyboardButton("❌ Close", callback_data=f"mse|cancel|{sess_tok}|0|{uid}")])
+
+    await safe_edit(st, "\n".join(lines),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^mse\|"))
+async def mse_cb(client: Client, cb: CallbackQuery):
+    """Handle magnet stream extraction callbacks."""
+    parts = cb.data.split("|")
+    if len(parts) < 5:
+        return await cb.answer("Invalid data.", show_alert=True)
+
+    _, stype, sess_tok, idx_str, uid_str = parts[:5]
+    user_id = int(uid_str) if uid_str.isdigit() else cb.from_user.id
+    await cb.answer()
+
+    if stype == "cancel":
+        sess = _magnet_probe.pop(sess_tok, None)
+        if sess:
+            cleanup(sess["tmp"])
+        return await cb.message.delete()
+
+    sess = _magnet_probe.get(sess_tok)
+    if not sess:
+        return await safe_edit(cb.message, "❌ Session expired. Re-run Stream Extractor.",
+                               parse_mode=enums.ParseMode.HTML)
+
+    path  = sess["path"]
+    tmp   = sess["tmp"]
+    sd    = sess["streams"]
+    fname = sess.get("fname", os.path.basename(path))
+    base  = os.path.splitext(fname)[0]
+
+    from services import ffmpeg as FF
+    from services.uploader import upload_file as _upload
+
+    st = await cb.message.edit(f"📤 Extracting stream…")
+
+    try:
+        if stype in ("a_all", "s_all"):
+            # Extract all tracks of a type
+            stream_list = sd.get("audio" if stype == "a_all" else "subtitle", [])
+            if not stream_list:
+                return await safe_edit(st, "❌ No tracks found.")
+
+            await safe_edit(st, f"📤 Extracting {len(stream_list)} track(s)…")
+            for s in stream_list:
+                idx   = s.get("index", 0)
+                codec = (s.get("codec_name") or "").lower()
+                tags  = s.get("tags", {}) or {}
+                lang  = (tags.get("language") or "und").lower()
+
+                if stype == "a_all":
+                    out_ext = FF.audio_ext(codec)
+                    out = os.path.join(tmp, f"{base}_audio_{idx}_{lang}{out_ext}")
+                    caption = f"🎵 <b>Audio #{idx}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
+                else:
+                    out_ext = FF.subtitle_ext(codec)
+                    out = os.path.join(tmp, f"{base}_sub_{idx}_{lang}{out_ext}")
+                    caption = f"💬 <b>Subtitle #{idx}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
+
+                try:
+                    await FF.stream_op(path, out, ["-map", f"0:{idx}", "-c", "copy"])
+                    await client.send_document(
+                        user_id, out, caption=caption,
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    log.warning("mse all extract idx=%d: %s", idx, exc)
+
+            await st.delete()
+
+        else:
+            # Single stream extraction
+            all_streams = sd.get("video",[]) + sd.get("audio",[]) + sd.get("subtitle",[])
+            target = next((s for s in all_streams if str(s.get("index")) == idx_str), None)
+
+            if not target:
+                return await safe_edit(st, f"❌ Stream #{idx_str} not found.")
+
+            codec     = (target.get("codec_name") or "").lower()
+            codec_type = target.get("codec_type", "")
+            tags      = target.get("tags", {}) or {}
+            lang      = (tags.get("language") or "und").lower()
+
+            if codec_type == "subtitle" or stype == "s":
+                out_ext = FF.subtitle_ext(codec)
+                out = os.path.join(tmp, f"{base}_sub_{idx_str}_{lang}{out_ext}")
+                caption = f"💬 <b>Subtitle #{idx_str}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
+                force_doc = True
+            elif codec_type == "audio" or stype == "a":
+                out_ext = FF.audio_ext(codec)
+                out = os.path.join(tmp, f"{base}_audio_{idx_str}_{lang}{out_ext}")
+                caption = f"🎵 <b>Audio #{idx_str}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
+                force_doc = False
+            else:
+                ext = os.path.splitext(path)[1] or ".mp4"
+                out = os.path.join(tmp, f"{base}_video_{idx_str}{ext}")
+                w   = target.get("width", 0)
+                h   = target.get("height", 0)
+                caption = f"🎬 <b>Video #{idx_str}</b>  <code>{codec.upper()}  {w}x{h}</code>"
+                force_doc = False
+
+            await safe_edit(st, f"📤 Extracting stream #{idx_str}…")
+            await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
+            await _upload(client, st, out, caption=caption, force_document=force_doc)
+
+    except Exception as exc:
+        log.error("mse extraction failed: %s", exc, exc_info=True)
+        await safe_edit(st,
+            f"❌ Extraction failed: <code>{exc}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Magnet media info (file list + largest file stream info)
+# ─────────────────────────────────────────────────────────────
+
+async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
+    st  = await cb.message.edit("🧲 Probing magnet content…")
+    uid = cb.from_user.id
+
+    path, tmp, probe = await _probe_magnet_file(url, uid, st)
+    if not path:
+        return
+
+    sd    = probe.get("streams", {})
+    dur   = probe.get("duration", 0)
+    fname = probe.get("fname", os.path.basename(path))
+    fsize = os.path.getsize(path) if os.path.exists(path) else 0
+
+    from services.utils import human_size, fmt_hms
+    from services import ffmpeg as FF
+
+    v_streams = sd.get("video",    [])
+    a_streams = sd.get("audio",    [])
+    s_streams = sd.get("subtitle", [])
+
+    lines = [
+        "📊 <b>Magnet Media Info</b>",
+        "──────────────────────",
+        f"📄 <code>{fname[:50]}</code>",
+        f"💾 <code>{human_size(fsize)}</code>  ⏱ <code>{fmt_hms(dur)}</code>",
+        "──────────────────────",
+    ]
+
+    for s in v_streams:
+        codec = s.get("codec_name","?").upper()
+        w, h  = s.get("width",0), s.get("height",0)
+        fr    = s.get("r_frame_rate","0/1")
+        try:
+            n2, d2 = fr.split("/")
+            fps = f"{float(n2)/max(float(d2),1):.3f}fps"
+        except Exception:
+            fps = "?"
+        pix = s.get("pix_fmt","")
+        hdr_s = " HDR" if "10" in pix else ""
+        lines.append(f"🎬 <code>{codec}  {w}x{h}  {fps}{hdr_s}</code>")
+
+    for s in a_streams:
+        codec = s.get("codec_name","?").upper()
+        ch    = s.get("channels",0)
+        ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        lines.append(f"🎵 <code>{codec}  {ch_s}</code>  {_flag(lang)} {_lname(lang)}")
+
+    for s in s_streams[:6]:
+        codec = s.get("codec_name","?").upper()
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
+
+    if not any([v_streams, a_streams, s_streams]):
+        lines.append("⚠️ <i>No media streams detected.</i>")
+
+    # Try Telegraph for full mediainfo
+    kb_rows: list = []
+    try:
+        raw = await FF.get_mediainfo(path)
+        from services.telegraph import post_mediainfo
+        tph = await post_mediainfo(fname, raw)
+        kb_rows.append([InlineKeyboardButton("📋 Full MediaInfo →", url=tph)])
+    except Exception:
+        pass
+
+    kb_rows += [
+        [InlineKeyboardButton("🧲 Download File", callback_data=f"dl|video|{token}")],
+        [InlineKeyboardButton("❌ Close",         callback_data=f"dl|cancel|{token}")],
+    ]
+
+    cleanup(tmp)
+    await safe_edit(st, "\n".join(lines),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Upload helper — runs as independent task
 # ─────────────────────────────────────────────────────────────
 
@@ -303,7 +870,6 @@ async def _launch_download(
 ) -> None:
     tmp = make_tmp(cfg.download_dir, uid)
 
-    # Delete the keyboard message — the auto panel will appear separately
     try:
         await panel_msg.delete()
     except Exception:
@@ -356,8 +922,6 @@ async def _launch_download(
             pass
         return
 
-    # No status message — fire upload as its own independent task
-    # so it runs concurrently with other uploads
     from types import SimpleNamespace
     _up_dummy = SimpleNamespace(
         edit=lambda *a, **kw: asyncio.sleep(0),
@@ -368,37 +932,12 @@ async def _launch_download(
 
 
 # ─────────────────────────────────────────────────────────────
-# Info handler
+# Info handler (non-magnet)
 # ─────────────────────────────────────────────────────────────
 
 async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
     st   = await cb.message.edit("📊 Fetching info…")
     kind = classify(url)
-
-    if kind in ("magnet", "torrent"):
-        import urllib.parse as _up
-        dn  = re.search(r"[&?]dn=([^&]+)", url)
-        xt  = re.search(r"xt=urn:btih:([a-fA-F0-9]{40}|[A-Za-z2-7]{32})", url)
-        xl  = re.search(r"[&?]xl=([^&]+)", url)
-        trs = re.findall(r"tr=([^&]+)", url)
-        name = _up.unquote_plus(dn.group(1)) if dn else "Unknown"
-        h    = xt.group(1).upper() if xt else "—"
-        size = int(xl.group(1)) if xl else 0
-        lines = [
-            "🧲 <b>Magnet Info</b>", "──────────────────",
-            f"📄 <code>{name[:60]}</code>",
-            f"🔑 <code>{h}</code>",
-        ]
-        if size:
-            lines.append(f"💾 <code>{human_size(size)}</code>")
-        lines.append(f"📡 <b>Trackers:</b> <code>{len(trs)}</code>")
-        await safe_edit(st, "\n".join(lines),
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧲 Download", callback_data=f"dl|video|{token}")],
-                [InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
-            ]))
-        return
 
     if kind == "ytdlp":
         try:
@@ -441,7 +980,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             parse_mode=enums.ParseMode.HTML)
         return
 
-    # Direct link — probe first 5MB
+    # Direct link
     try:
         import aiohttp
         import tempfile
