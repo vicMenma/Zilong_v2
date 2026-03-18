@@ -384,6 +384,8 @@ class LivePanel:
                 log.debug("LivePanel edit uid=%d: %s", self._uid, exc)
 
     async def _loop(self) -> None:
+        had_tasks = False   # flips True once at least one task is registered
+
         while not self._stopped:
             try:
                 await asyncio.wait_for(self._wake_ev.wait(), timeout=EDIT_INTERVAL)
@@ -399,16 +401,22 @@ class LivePanel:
             if since_last < 1.0:
                 await asyncio.sleep(1.0 - since_last)
 
-            # If all tasks for this user are terminal, delete the panel and exit
             tasks = tracker.tasks_for_user(self._uid)
-            all_done = tasks and all(t.is_terminal for t in tasks)
-            if all_done:
-                try:
-                    await self._msg.delete()
-                except Exception:
-                    pass
-                self._stopped = True
-                break
+
+            # Track whether we ever had tasks
+            if tasks:
+                had_tasks = True
+
+            # Once we had tasks and now everything is terminal (or evicted), delete and exit
+            if had_tasks:
+                active = [t for t in tasks if not t.is_terminal]
+                if not active:
+                    try:
+                        await self._msg.delete()
+                    except Exception:
+                        pass
+                    self._stopped = True
+                    break
 
             await self._edit()
 
