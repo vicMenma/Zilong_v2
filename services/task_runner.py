@@ -407,22 +407,15 @@ class LivePanel:
             if tasks:
                 had_tasks = True
 
-            # Delete panel only when we had tasks AND nothing is still running
-            # Check ALL modes — don't delete while an upload is still in progress
-            if had_tasks:
-                active = [t for t in tasks if not t.is_terminal]
-                # Also check for tasks that registered in the last 3s (just started)
-                recently_started = [
-                    t for t in tasks
-                    if t.is_terminal and (time.time() - (t.finished or 0)) < 5
-                ]
-                if not active and not recently_started:
-                    try:
-                        await self._msg.delete()
-                    except Exception:
-                        pass
-                    self._stopped = True
-                    break
+            # Only delete when ALL tasks are gone from memory (evicted after TASK_LINGER)
+            # This ensures we never delete mid-download or between download→upload
+            if had_tasks and not tasks:
+                try:
+                    await self._msg.delete()
+                except Exception:
+                    pass
+                self._stopped = True
+                break
 
             await self._edit()
 
