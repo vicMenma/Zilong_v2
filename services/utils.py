@@ -245,12 +245,13 @@ def largest_file(directory: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────
 
 async def system_stats() -> dict:
-    out = {"cpu": 0.0, "ram_pct": 0.0, "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0}
+    out = {"cpu": 0.0, "ram_pct": 0.0, "ram_used": 0, "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0}
     try:
         import psutil
         out["cpu"] = psutil.cpu_percent(interval=None)
         vm = psutil.virtual_memory()
-        out["ram_pct"] = vm.percent
+        out["ram_pct"]  = vm.percent
+        out["ram_used"] = vm.used
         out["disk_free"] = psutil.disk_usage("/").free
         n1 = psutil.net_io_counters()
         await asyncio.sleep(0.25)

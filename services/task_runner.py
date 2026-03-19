@@ -221,121 +221,135 @@ tracker = GlobalTracker()
 # Panel renderer  — redesigned card-style layout
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 18) -> str:
-    """Block-fill bar: ██████████░░░░░░░░ 57%"""
+def _bar(pct: float, w: int = 12) -> str:
+    """Reference bot style: [████████░░░░]"""
     pct    = min(max(pct, 0), 100)
     filled = int(pct / 100 * w)
-    empty  = w - filled
-    return "█" * filled + "░" * empty
+    return "█" * filled + "░" * (w - filled)
 
 
 def _spd_icon(bps: float) -> str:
     mib = bps / (1024 * 1024)
-    if mib >= 20: return "⚡"
-    if mib >= 5:  return "🔥"
+    if mib >= 50: return "🚀"
+    if mib >= 10: return "⚡"
     if mib >= 1:  return "🏃"
     return "🐢"
 
 
 def _ring(p: float) -> str:
-    return "🟢" if p < 50 else ("🟡" if p < 80 else "🔴")
-
-
-_PANEL_HEADER = (
-    "⚡ <b>ZILONG MULTIUSAGE BOT</b>\n"
-    "——————————————————————"
-)
+    return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
+    """
+    Renders progress panel in reference-bot style:
+    one card per active task with status_bar format + sysINFO footer.
+    """
     from services.utils import human_size, human_dur, system_stats
 
-    tasks    = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
-    active   = [t for t in tasks if not t.is_terminal]
-    finished = [t for t in tasks if t.is_terminal]
-    now      = time.time()
+    tasks  = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
+    active = [t for t in tasks if not t.is_terminal]
 
-    # Fix C: count all genuinely active download/processing tasks regardless of
-    # whether they went through the semaphore (smart_download bypasses it).
-    # A task is "running" if it's active, not queued, and is a download/proc.
     n_running = sum(
         1 for t in active
-        if t.mode in ("dl", "proc", "magnet")
-        and not t.state.startswith("⏳")
+        if t.mode in ("dl", "proc", "magnet") and not t.state.startswith("⏳")
     )
     n_queued  = sum(1 for t in active if t.state.startswith("⏳"))
     n_uploads = sum(1 for t in active if t.mode == "ul")
 
-    lines: list[str] = [_PANEL_HEADER, ""]
+    lines: list[str] = []
 
-    # ── Active tasks ──────────────────────────────────────────
+    # ── One card per active task ───────────────────────────────
     for t in active:
         pct     = t.pct()
-        bar     = _bar(pct, 18)
+        bar     = _bar(pct, 12)
         elapsed = human_dur(int(t.elapsed)) if t.elapsed else "0s"
-
-        # File name line — always show just the filename with a folder icon
         fname   = (t.fname or t.label)
-        fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
-        lines.append(f"📁 <code>{fname_s}</code>")
+        fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
 
-        if t.state == "⏳ Queued" and t.mode in ("dl", "proc", "magnet"):
-            lines += [
-                f"⏳ <b>Queued</b> — waiting for a free slot",
-                "",
-            ]
-            continue
-
-        if t.meta_phase:
-            lines += [
-                f"🔍 <b>Fetching metadata…</b>  <code>{elapsed}</code>",
-                f"<i>Contacting trackers, this may take up to 90s</i>",
-                "",
-            ]
-            continue
-
-        # Progress bar  ██████░░░░░░ 57%
-        lines.append(f"<code>{bar}</code> <b>{pct:.1f}%</b>")
-
-        # Speed
-        spd_s = (human_size(t.speed) + "/s") if t.speed else "0 B/s"
-        lines.append(f"{_spd_icon(t.speed)} <b>Speed:</b> {spd_s}")
-
-        # Done / total
-        if t.total:
-            lines.append(f"🔄 <b>Done:</b> {human_size(t.done)} of {human_size(t.total)}")
-        elif t.done:
-            lines.append(f"🔄 <b>Done:</b> {human_size(t.done)}")
-
-        # ETA | Elapsed
-        eta_s = human_dur(t.eta) if t.eta > 0 else "-"
-        lines.append(f"⏳ <b>ETA:</b> {eta_s} | <b>Elapsed:</b> {elapsed}")
-
-        # Engine | Mode
-        lines.append(f"⚙️ <b>Engine:</b> {t.engine_lbl} | <b>Mode:</b> #{t.mode_lbl}")
-
-        if t.seeds:
-            lines.append(f"🌱 <b>Seeds:</b> {t.seeds}")
-
+        # ── Mode header  (📥 DOWNLOADING / 📤 UPLOADING / ⚙️ PROCESSING)
+        mode_headers = {
+            "dl":     "📥 <b>DOWNLOADING</b>",
+            "ul":     "📤 <b>UPLOADING</b>",
+            "magnet": "🧲 <b>TORRENT</b>",
+            "proc":   "⚙️ <b>PROCESSING</b>",
+        }
+        header = mode_headers.get(t.mode, "⚙️ <b>PROCESSING</b>")
+        lines.append(f"{header}")
+        lines.append(f"")
+        lines.append(f"<code>{fname_s}</code>")
         lines.append("")
 
-    # ── System stats + slot info ───────────────────────────────
+        # ── Queued ────────────────────────────────────────────
+        if t.state.startswith("⏳"):
+            lines += [
+                "⏳ <b>Queued</b> — waiting for a free slot",
+                "──────────────────",
+                "",
+            ]
+            continue
+
+        # ── Metadata phase ────────────────────────────────────
+        if t.meta_phase:
+            lines += [
+                f"🔍 <b>Fetching metadata…</b>",
+                f"──────────────────",
+                f"⚙️  <b>Engine</b>   <code>{t.engine_lbl}</code>",
+                f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>",
+                f"<i>Contacting trackers, please wait…</i>",
+                "──────────────────",
+                "",
+            ]
+            continue
+
+        # ── Progress bar ──────────────────────────────────────
+        lines.append(f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>")
+        lines.append("──────────────────")
+
+        # Speed
+        spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
+        lines.append(f"{_spd_icon(t.speed)}  <b>Speed</b>    <code>{spd_s}</code>")
+
+        # Engine
+        lines.append(f"⚙️  <b>Engine</b>   <code>{t.engine_lbl}</code>")
+
+        # ETA
+        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
+        lines.append(f"⏳  <b>ETA</b>      <code>{eta_s}</code>")
+
+        # Elapsed
+        lines.append(f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>")
+
+        # Done / Total
+        lines.append(f"✅  <b>Done</b>     <code>{human_size(t.done)}</code>")
+        if t.total:
+            lines.append(f"📦  <b>Total</b>    <code>{human_size(t.total)}</code>")
+
+        # Seeds (torrent)
+        if t.seeds:
+            lines.append(f"🌱  <b>Seeds</b>    <code>{t.seeds}</code>")
+
+        lines += ["──────────────────", ""]
+
+    # ── sysINFO footer (reference bot style) ──────────────────
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
-    rp    = stats.get("ram_pct", 0.0)
+    ram   = stats.get("ram_pct", 0.0)
     df    = stats.get("disk_free", 0)
     dl    = stats.get("dl_speed", 0.0)
     ul    = stats.get("ul_speed", 0.0)
 
     slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
-    ul_tag  = f" · 📤 {n_uploads} uploading" if n_uploads else ""
-    q_tag   = f" · ⏳ {n_queued} queued"     if n_queued  else ""
+    ul_tag  = f" · 📤{n_uploads}" if n_uploads else ""
+    q_tag   = f" · ⏳{n_queued}"  if n_queued  else ""
 
     lines += [
-        "——————————————————————",
-        f"🖥 <b>CPU:</b> {cpu:.1f}% | 💿 <b>FREE:</b> {human_size(df)}",
-        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {slots_s}{ul_tag}{q_tag}",
-        f"⬇️ <b>DL:</b> {human_size(dl)}/s | ⬆️ <b>UL:</b> {human_size(ul)}/s",
+        "──────────────────",
+        f"🖥  CPU  {_ring(cpu)}<code>[{_bar(cpu, 8)}]</code> <b>{cpu:.0f}%</b>",
+        f"💾  RAM  <code>{human_size(stats.get('ram_used', 0) or 0)}</code>  ·  "
+        f"Slots <code>{slots_s}{ul_tag}{q_tag}</code>",
+        f"💿  Disk Free  <code>{human_size(df)}</code>",
+        f"⬇️  <code>{human_size(dl)}/s</code>  ⬆️  <code>{human_size(ul)}/s</code>",
     ]
 
     return "\n".join(lines)
