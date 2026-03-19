@@ -2,14 +2,11 @@
 services/uploader.py
 Upload a local file to Telegram.
 
-Reference-bot pattern adopted:
-- upload_file() accepts an optional `status_msg` — the live panel message.
-- During upload the progress callback edits that message directly
-  (throttled to 3 seconds, exactly like the reference bot's isTimeOver()).
-- This gives seamless download→upload in a SINGLE message, no gap.
-- TaskRecord is still updated for /status and multi-user tracking.
-- FloodWait retry preserved.
-- Metadata via services/ffmpeg.video_meta() (correct -analyzeduration flags).
+- Metadata + thumbnail via services/ffmpeg.video_meta() (correct probe flags)
+- Shows "🔍 Analyzing…" state during ffprobe so user knows it's not frozen
+- Global upload semaphore (1 slot) prevents Pyrogram deadlock when two large
+  send_video() calls run simultaneously on the same client
+- FloodWait retry preserved
 """
 from __future__ import annotations
 
@@ -55,14 +52,9 @@ async def upload_file(
     thumb:          str | None = None,
     force_document: bool = False,
     task_record     = None,
-    status_msg      = None,      # reference-bot pattern: the live panel message
+    status_msg      = None,      # accepted for API compatibility, not used
 ) -> None:
-    """
-    Upload `path` to Telegram.
-
-    status_msg — if provided, this message is edited directly during upload
-                 (reference bot pattern). Throttled to once every 3 seconds.
-    """
+    """Upload `path` to Telegram."""
     if not os.path.isfile(path):
         await safe_edit(msg,
             f"❌ File not found: <code>{os.path.basename(path)}</code>",
@@ -200,3 +192,39 @@ async def upload_file(
         record.update(state="✅ Done", done=file_size, total=file_size)
         runner._wake_panel(chat_id)
 
+    # Acquire the global upload semaphore BEFORE calling send_video/send_audio/
+    # send_document.  Pyrogram deadlocks when two large uploads run concurrently
+    # on the same client (both wait for a connection the other holds).
+    # One upload at a time — matches the reference bot's sequential loop.
+    from services.task_runner import runner as _runner_ul
+    upload_sem = _runner_ul._get_upload_sem()
+
+    try:
+        async with upload_sem:
+            record.update(state="📤 Uploading")
+            _runner_ul._wake_panel(chat_id, immediate=True)
+            await _send()
+    except FloodWait as fw:
+        if fw.value <= 60:
+            log.warning("FloodWait %ds — waiting", fw.value)
+            record.update(state=f"⏳ FloodWait {fw.value}s")
+            await asyncio.sleep(fw.value)
+            async with upload_sem:
+                await _send()
+        else:
+            raise
+    except Exception as exc:
+        err = str(exc)
+        if "MESSAGE_NOT_MODIFIED" not in err:
+            record.update(state=f"❌ {str(exc)[:60]}")
+            runner._wake_panel(chat_id)
+            await safe_edit(msg,
+                f"❌ Upload failed: <code>{exc}</code>",
+                parse_mode=enums.ParseMode.HTML)
+        raise
+    finally:
+        if auto_thumb and os.path.isfile(auto_thumb):
+            try:
+                os.remove(auto_thumb)
+            except OSError:
+                pass

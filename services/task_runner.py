@@ -475,6 +475,16 @@ class TaskRunner:
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
         self._running       = False
+        # Serialize ALL uploads through one slot.
+        # Pyrogram/pyrofork deadlocks when two large send_video() calls run
+        # simultaneously on the same client — both wait for a connection that
+        # the other is holding.  One upload at a time avoids this entirely.
+        self._upload_sem:   asyncio.Semaphore | None = None
+
+    def _get_upload_sem(self) -> asyncio.Semaphore:
+        if self._upload_sem is None:
+            self._upload_sem = asyncio.Semaphore(1)
+        return self._upload_sem
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
         if uid not in self._panel_locks:
@@ -486,6 +496,7 @@ class TaskRunner:
         # Pre-create the semaphore on the running event loop
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        self._upload_sem = asyncio.Semaphore(1)   # one upload at a time
 
     def stop(self) -> None:
         self._running = False
