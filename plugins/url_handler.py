@@ -858,9 +858,9 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 # Upload helper — runs as independent task
 # ─────────────────────────────────────────────────────────────
 
-async def _upload_and_cleanup(client, msg, path: str, tmp: str, status_msg=None) -> None:
+async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
     try:
-        await upload_file(client, msg, path, status_msg=status_msg)
+        await upload_file(client, msg, path)
     except Exception as exc:
         log.error("Upload failed for %s: %s", path, exc)
     finally:
@@ -906,17 +906,8 @@ async def _launch_download(
         raw = url.split("/")[-1].split("?")[0]
         label = _up.unquote_plus(raw)[:50] or "Download"
 
-    # Give immediate visible feedback — clean one-liner, no raw URL shown
-    try:
-        short = (label[:45] + "…") if len(label) > 45 else label
-        await panel_msg.edit(
-            f"{'🧲' if kind in ('magnet','torrent') else '📥'} <b>Starting…</b>  "
-            f"<code>{short}</code>\n"
-            f"<i>Progress panel will appear shortly.</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-    except Exception:
-        asyncio.create_task(_safe_delete(panel_msg))
+    # Silently delete the keyboard message — the panel appears automatically
+    asyncio.create_task(_safe_delete(panel_msg))
 
     try:
         path = await smart_download(
@@ -969,23 +960,13 @@ async def _launch_download(
             pass
         return
 
-    # Get the live panel message for this user so upload_file can edit it
-    # directly during upload — reference bot pattern, no dummy message needed.
-    from services.task_runner import runner as _runner
-    panel_ref = None
-    panel_obj = _runner._panels.get(uid)
-    if panel_obj and not panel_obj._stopped:
-        panel_ref = panel_obj._msg
-
     from types import SimpleNamespace
     _up_dummy = SimpleNamespace(
         edit=lambda *a, **kw: asyncio.sleep(0),
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
-    asyncio.create_task(
-        _upload_and_cleanup(client, _up_dummy, path, tmp, status_msg=panel_ref)
-    )
+    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
