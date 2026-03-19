@@ -165,10 +165,12 @@ class UserStore:
 # ─────────────────────────────────────────────────────────────
 
 _DEFAULTS: dict[str, Any] = {
-    "upload_mode":  "auto",      # "auto" | "document"
-    "prefix":       "",          # prepended to every cleaned filename
-    "suffix":       "",          # appended before extension
-    "thumb_id":     None,        # Telegram file_id of saved thumbnail
+    "upload_mode":      "auto",   # "auto" | "document"
+    "prefix":           "",       # prepended to every cleaned filename
+    "suffix":           "",       # appended before extension
+    "thumb_id":         None,     # Telegram file_id of saved thumbnail
+    "auto_forward":     False,    # copy to all channels automatically after upload
+    "forward_channels": [],       # list of {"id": int, "name": str}
 }
 
 
