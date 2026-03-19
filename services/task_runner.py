@@ -10,6 +10,8 @@ Changes:
 """
 from __future__ import annotations
 
+from core.bot_name import get_bot_name
+
 import asyncio
 import logging
 import os
@@ -259,7 +261,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     n_uploads = sum(1 for t in active if t.mode == "ul")
 
     lines: list[str] = [
-        "⚡️ <b>ZILONG MULTIUSAGE BOT</b>",
+        "⚡️ <b>" + get_bot_name().upper() + " MULTIUSAGE BOT</b>",
         _SEP,
         "",
     ]
