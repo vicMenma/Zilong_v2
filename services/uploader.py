@@ -22,7 +22,7 @@ from pyrogram import Client, enums
 from pyrogram.errors import FloodWait
 
 from core.config import cfg
-from services.utils import human_size, human_dur, safe_edit
+from services.utils import human_size, safe_edit
 
 log = logging.getLogger(__name__)
 
@@ -45,20 +45,6 @@ def _chat_id(msg) -> int:
     except Exception:
         pass
     return 0
-
-
-def _spd_icon(bps: float) -> str:
-    mib = bps / (1024 * 1024)
-    if mib >= 50: return "🚀"
-    if mib >= 10: return "⚡"
-    if mib >= 1:  return "🏃"
-    return "🐢"
-
-
-def _bar(pct: float, w: int = 12) -> str:
-    pct    = min(max(pct, 0), 100)
-    filled = int(pct / 100 * w)
-    return "█" * filled + "░" * (w - filled)
 
 
 async def upload_file(
@@ -146,7 +132,6 @@ async def upload_file(
         record.update(mode="ul", engine="telegram", total=file_size, fname=fname)
 
     start      = time.time()
-    last_edit  = [0.0]   # throttle: edit status_msg at most once every 3s
     last_panel = [start]
 
     async def _progress(current: int, total: int) -> None:
@@ -154,9 +139,8 @@ async def upload_file(
         elapsed = now - start
         speed   = current / elapsed if elapsed else 0
         eta     = int((total - current) / speed) if speed else 0
-        pct     = min(current / total * 100, 100) if total else 0
 
-        # Update TaskRecord for /status panel
+        # Update TaskRecord — the panel loop reads this and re-renders
         record.update(
             done=current, total=total,
             speed=speed, eta=eta, elapsed=elapsed,
@@ -165,30 +149,6 @@ async def upload_file(
         if now - last_panel[0] >= 1.0:
             last_panel[0] = now
             runner._wake_panel(chat_id)
-
-        # Direct status_msg edit — reference bot pattern, 3s throttle
-        if status_msg is not None and now - last_edit[0] >= 3.0:
-            last_edit[0] = now
-            bar     = _bar(pct, 12)
-            spd_s   = human_size(speed) + "/s"
-            eta_s   = human_dur(eta) if eta > 0 else "—"
-            el_s    = human_dur(int(elapsed))
-            text = (
-                f"📤 <b>UPLOADING</b>\n\n"
-                f"<code>{(fname[:48] + '…') if len(fname) > 48 else fname}</code>\n\n"
-                f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>\n"
-                f"──────────────────\n"
-                f"{_spd_icon(speed)}  <b>Speed</b>    <code>{spd_s}</code>\n"
-                f"⚙️  <b>Engine</b>   <code>Pyrofork</code>\n"
-                f"⏳  <b>ETA</b>      <code>{eta_s}</code>\n"
-                f"🕰  <b>Elapsed</b>  <code>{el_s}</code>\n"
-                f"✅  <b>Done</b>     <code>{human_size(current)}</code>\n"
-                f"📦  <b>Total</b>    <code>{human_size(total)}</code>"
-            )
-            try:
-                await status_msg.edit(text, parse_mode=enums.ParseMode.HTML)
-            except Exception:
-                pass
 
     async def _send() -> None:
         common = dict(

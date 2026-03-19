@@ -444,6 +444,7 @@ async def smart_download(
 ) -> str:
     from services.task_runner import tracker, TaskRecord, runner
 
+    import urllib.parse as _uparse
     kind   = classify(url)
     engine = {
         "magnet":    "magnet",
@@ -454,6 +455,10 @@ async def smart_download(
         "direct":    "direct",
     }.get(kind, "direct")
 
+    # URL-decode the label so "Oshi%20no%20Ko" → "Oshi no Ko"
+    raw_label = label or url.split("/")[-1].split("?")[0][:40] or "Download"
+    clean_label = _uparse.unquote_plus(raw_label)[:50]
+
     tid    = tracker.new_tid()
     # Fix B: magnet/torrent tasks start in metadata phase immediately.
     # This ensures auto_panel renders "🔍 Fetching metadata…" rather than
@@ -462,7 +467,7 @@ async def smart_download(
     initial_state  = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
     record = TaskRecord(
         tid=tid, user_id=user_id,
-        label=label or url.split("/")[-1].split("?")[0][:40] or "Download",
+        label=clean_label,
         mode="magnet" if kind in ("magnet", "torrent") else "dl",
         engine=engine,
         meta_phase=initial_meta,
