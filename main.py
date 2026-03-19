@@ -72,10 +72,10 @@ def build_client() -> Client:
     # streams per upload — each stream handles its own chunk concurrently.
     # This is the correct way to get parallel uploads in pyrofork >= 2.3.x
     # (the save_file patch no longer works as that function was removed).
-    if "concurrent_transmissions" in sig.parameters:
+    if "max_concurrent_transmissions" in sig.parameters:
         ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
-        kwargs["concurrent_transmissions"] = ct
-        log.info("⚡ concurrent_transmissions=%d (parallel upload streams)", ct)
+        kwargs["max_concurrent_transmissions"] = ct
+        log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", ct)
     return Client(**kwargs)
 
 
