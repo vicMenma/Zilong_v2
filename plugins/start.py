@@ -9,36 +9,35 @@ from pyrogram.types import (
 )
 from core.config import cfg
 from core.session import users, settings
+from core.bot_name import get_bot_name
 from services.utils import human_size
 
-HELP_TEXT = """⚡ <b>ZILONG BOT — Features</b>
-
-📹 <b>Video processing</b>
-› Trim · Split · Merge · Rename
-› Stream Extractor / Mapper / Remover
-› Auto + Manual Screenshots · Sample Clip
-› Convert · Optimize (CRF) · Metadata
-› Subtitle mux/burn · Audio-Video merge
-
-🎵 <b>Audio</b>
-› Extract · Remove · Convert
-› Formats: mp3 aac m4a opus ogg flac wav wma ac3
-
-🔗 <b>Downloads</b>
-› HTTP/HTTPS direct links
-› YouTube · Instagram · TikTok · Twitter and 1000+ sites
-› Google Drive · Mediafire
-› Torrents &amp; Magnet links via aria2c
-
-📦 <b>Archives</b>
-› Extract: zip rar 7z tar.gz
-› Create: zip 7z tar.gz
-
-📨 <b>Forward</b> without forward tag
-
-⚙️ /settings · /info · /status
-📊 /status — live dashboard
-📋 /log — last 50 log lines (admin)"""
+def _help_text() -> str:
+    n = get_bot_name().upper()
+    return (
+        f"⚡ <b>{n} BOT — Features</b>\n\n"
+        "📹 <b>Video processing</b>\n"
+        "› Trim · Split · Merge · Rename\n"
+        "› Stream Extractor / Mapper / Remover\n"
+        "› Auto + Manual Screenshots · Sample Clip\n"
+        "› Convert · Optimize (CRF) · Metadata\n"
+        "› Subtitle mux/burn · Audio-Video merge\n\n"
+        "🎵 <b>Audio</b>\n"
+        "› Extract · Remove · Convert\n"
+        "› Formats: mp3 aac m4a opus ogg flac wav wma ac3\n\n"
+        "🔗 <b>Downloads</b>\n"
+        "› HTTP/HTTPS direct links\n"
+        "› YouTube · Instagram · TikTok · Twitter and 1000+ sites\n"
+        "› Google Drive · Mediafire\n"
+        "› Torrents &amp; Magnet links via aria2c\n\n"
+        "📦 <b>Archives</b>\n"
+        "› Extract: zip rar 7z tar.gz\n"
+        "› Create: zip 7z tar.gz\n\n"
+        "📨 <b>Forward</b> without forward tag\n\n"
+        "⚙️ /settings · /info · /status\n"
+        "📊 /status — live dashboard\n"
+        "📋 /log — last 50 log lines (admin)"
+    )
 
 
 def _start_kb() -> InlineKeyboardMarkup:
@@ -83,7 +82,7 @@ def _back_kb() -> InlineKeyboardMarkup:
 
 def _welcome(name: str) -> str:
     return (
-        f"⚡ <b>ZILONG BOT</b>\n\n"
+        f"⚡ <b>{get_bot_name().upper()} BOT</b>\n\n"
         f"Hello <b>{name}</b>!\n\n"
         "Send me a link, video, or audio file and I'll handle the rest.\n\n"
         "📥 Download from any URL\n"
@@ -105,7 +104,7 @@ async def cmd_start(client: Client, msg: Message):
 
 @Client.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, msg: Message):
-    await msg.reply(HELP_TEXT, parse_mode=enums.ParseMode.HTML,
+    await msg.reply(_help_text(), parse_mode=enums.ParseMode.HTML,
                     disable_web_page_preview=True)
 
 
@@ -146,7 +145,7 @@ async def cq_start(client: Client, cb: CallbackQuery):
 
 @Client.on_callback_query(filters.regex("^cb_help$"))
 async def cq_help(client: Client, cb: CallbackQuery):
-    await cb.message.edit(HELP_TEXT, parse_mode=enums.ParseMode.HTML,
+    await cb.message.edit(_help_text(), parse_mode=enums.ParseMode.HTML,
                           reply_markup=_back_kb())
     await cb.answer()
 
