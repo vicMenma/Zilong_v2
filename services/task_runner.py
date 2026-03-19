@@ -227,12 +227,20 @@ def _ring(p: float) -> str:
 
 
 def _prog_bar(pct: float, cells: int = 10) -> str:
-    """▰▰▰▱▱ progress bar — 10 cells, mobile-safe."""
+    """█░ ASCII progress bar inside <code> — renders on every Android font."""
     filled = round(pct / 100 * cells)
-    return "▰" * filled + "▱" * (cells - filled)
+    return "█" * filled + "░" * (cells - filled)
 
 
-_SEP = "════════════════════════════════"
+_SEP  = "════════════════════════════════"
+_SEP2 = "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌"
+
+_MODE_HEADER = {
+    "dl":     "📥 Downloading",
+    "ul":     "📤 Uploading",
+    "magnet": "🧲 Torrent",
+    "proc":   "⚙️ Processing",
+}
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
@@ -247,7 +255,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         if t.mode in ("dl", "proc", "magnet") and not t.state.startswith("⏳")
     )
     n_queued  = sum(1 for t in active if t.state.startswith("⏳"))
-    n_uploads = sum(1 for t in active if t.mode == "ul")
 
     bot_name   = get_bot_name().upper()
     active_lbl = f"{len(active)} active" if active else "idle"
@@ -257,7 +264,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         _SEP,
     ]
 
-    for t in active:
+    for i, t in enumerate(active):
         pct      = t.pct()
         elapsed  = human_dur(int(t.elapsed)) if t.elapsed else "0s"
         fname    = t.fname or t.label
@@ -268,8 +275,13 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             "magnet": "Torrent",
             "proc":   "Processing",
         }.get(t.mode, t.mode)
+        mode_hdr = _MODE_HEADER.get(t.mode, f"⚙️ {mode_lbl}")
 
-        lines.append("")
+        # Dashed divider between tasks (not before the first one)
+        if i > 0:
+            lines += ["", _SEP2, ""]
+
+        lines.append(f"<b>[ {i + 1} ]  {mode_hdr}</b>")
 
         if t.state.startswith("⏳"):
             lines += [
@@ -309,19 +321,21 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         if t.seeds:
             lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
-    stats = await system_stats()
-    cpu   = stats.get("cpu", 0.0)
-    rp    = stats.get("ram_pct", 0.0)
-    df    = stats.get("disk_free", 0)
-    dl    = stats.get("dl_speed", 0.0)
-    ul    = stats.get("ul_speed", 0.0)
+    # ── System footer — pairs layout ─────────────────────────
+    stats   = await system_stats()
+    cpu     = stats.get("cpu", 0.0)
+    rp      = stats.get("ram_pct", 0.0)
+    df      = stats.get("disk_free", 0)
+    dl      = stats.get("dl_speed", 0.0)
+    ul      = stats.get("ul_speed", 0.0)
     slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
 
     lines += [
         "",
         _SEP,
-        f"🖥 <b>CPU</b>  <code>{cpu:.1f}%</code>   💾 <b>Mem</b>  <code>{rp:.1f}%</code>   💿 <b>Disk</b>  <code>{human_size(df)}</code>",
-        f"⬆️ <code>{human_size(ul)}/s</code>   ⬇️ <code>{human_size(dl)}/s</code>   🎰 <b>Slots</b>  <code>{slots_s}</code>",
+        f"🖥 <b>CPU</b>  <code>{cpu:.1f}%</code>      💾 <b>Mem</b>   <code>{rp:.1f}%</code>",
+        f"💿 <b>Disk</b> <code>{human_size(df)}</code>  🎰 <b>Slots</b> <code>{slots_s}</code>",
+        f"⬆️ <b>Up</b>   <code>{human_size(ul)}/s</code>  ⬇️ <b>Down</b>  <code>{human_size(dl)}/s</code>",
     ]
 
     return "\n".join(lines)
@@ -430,7 +444,7 @@ class TaskRunner:
     # connection pool internally — the deadlock cannot occur anymore.
     # 3 is the safe maximum: above this Telegram's MTProto rate-limiter starts
     # dropping chunks for a single bot token, which actually reduces throughput.
-    _UPLOAD_CONCURRENCY: int = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
+    _UPLOAD_CONCURRENCY: int = int(os.environ.get("UPLOAD_CONCURRENCY", "1"))
 
     def __init__(self) -> None:
         self._panels:       dict[int, LivePanel] = {}
