@@ -166,8 +166,8 @@ class UserStore:
 
 _DEFAULTS: dict[str, Any] = {
     "upload_mode":  "auto",      # "auto" | "document"
-    "rename_file":  False,
-    "custom_name":  "",
+    "prefix":       "",          # prepended to every cleaned filename
+    "suffix":       "",          # appended before extension
     "thumb_id":     None,        # Telegram file_id of saved thumbnail
 }
 
