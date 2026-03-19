@@ -29,7 +29,7 @@ from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import (
     cleanup, fmt_hms, human_size, lang_flag, lang_name,
-    make_tmp, progress_panel, safe_edit,
+    make_tmp, safe_edit,
 )
 
 log = logging.getLogger(__name__)
@@ -162,10 +162,6 @@ async def _ensure(client: Client, session: FileSession, st) -> str | None:
         return session.local_path
 
     dest = os.path.join(session.tmp_dir, session.fname)
-    await safe_edit(st, progress_panel(
-        mode="dl", fname=session.fname,
-        done=0, total=session.fsize, engine="telegram",
-    ), parse_mode=enums.ParseMode.HTML)
     try:
         path = await tg_download(client, session.file_id, dest, st,
                                  fname=session.fname, fsize=session.fsize)

@@ -1236,16 +1236,10 @@ async def _download_url_fmt(
     last  = [start]
 
     async def _progress(done: int, total: int, speed: float, eta: int) -> None:
-        from services.utils import progress_panel
         now = time.time()
         if now - last[0] < 3.0:
             return
         last[0] = now
-        panel = progress_panel(
-            mode="dl", done=done, total=total,
-            speed=speed, eta=eta, elapsed=now - start, engine="ytdlp",
-        )
-        await safe_edit(st, panel, parse_mode=enums.ParseMode.HTML)
 
     try:
         path = await download_ytdlp(
@@ -1325,15 +1319,9 @@ async def se_mag_cb(client: Client, cb: CallbackQuery):
         start = time.time(); last = [start]
 
         async def _mag_prog(done: int, total: int, speed: float, eta: int) -> None:
-            from services.utils import progress_panel
             now = time.time()
             if now - last[0] < 3.0: return
             last[0] = now
-            panel = progress_panel(
-                mode="magnet", done=done, total=total,
-                speed=speed, eta=eta, elapsed=now - start, engine="aria2",
-            )
-            await safe_edit(st, panel, parse_mode=enums.ParseMode.HTML)
 
         try:
             path = await download_aria2(magnet, tmp, is_file=False, progress=_mag_prog)
@@ -1369,16 +1357,9 @@ async def se_mag_cb(client: Client, cb: CallbackQuery):
         start = time.time(); last = [start]
 
         async def _file_prog(done: int, total: int, speed: float, eta: int) -> None:
-            from services.utils import progress_panel
             now = time.time()
             if now - last[0] < 3.0: return
             last[0] = now
-            panel = progress_panel(
-                mode="magnet", fname=fname, done=done,
-                total=total or fsize, speed=speed, eta=eta,
-                elapsed=now - start, engine="aria2",
-            )
-            await safe_edit(st, panel, parse_mode=enums.ParseMode.HTML)
 
         try:
             api = aria2p.API(aria2p.Client(
