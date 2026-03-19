@@ -48,6 +48,9 @@ _CACHE_MAX = 500
 # Store magnet probe sessions: tok → {"path": str, "tmp": str, "streams": dict}
 _magnet_probe: dict[str, dict] = {}
 
+# Pending manual renames: uid → {url, audio_only, fmt_id}
+_rename_pending: dict[int, dict] = {}
+
 
 def _store(url: str) -> str:
     token = hashlib.md5(url.encode()).hexdigest()[:10]
@@ -539,18 +542,46 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             url2   = url
             fmt_id = raw or None
         _cache.pop(token, None)
-        asyncio.create_task(
-            _launch_download(client, cb.message, url2, uid, fmt_id=fmt_id)
-        )
+
+        from core.session import settings as _settings
+        s = await _settings.get(uid)
+        if s.get("rename_mode", "auto") == "manual":
+            _rename_pending[uid] = {"url": url2, "audio_only": False, "fmt_id": fmt_id, "msg": cb.message}
+            await cb.message.edit(
+                "✏️ <b>Manual Rename</b>\n\n"
+                "Send the desired filename <i>(without extension)</i>:\n\n"
+                "Example: <code>Reborn as a Cat S01E20</code>\n\n"
+                "<i>Send /skip to use the automatic name.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        else:
+            asyncio.create_task(
+                _launch_download(client, cb.message, url2, uid, fmt_id=fmt_id)
+            )
         return
 
     # ── Standard download ─────────────────────────────────────
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
         _cache.pop(token, None)
-        asyncio.create_task(
-            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
-        )
+
+        # Check rename_mode setting
+        from core.session import settings as _settings
+        s = await _settings.get(uid)
+        if s.get("rename_mode", "auto") == "manual":
+            # Ask the user for a custom name before downloading
+            _rename_pending[uid] = {"url": url, "audio_only": audio_only, "fmt_id": None, "msg": cb.message}
+            await cb.message.edit(
+                "✏️ <b>Manual Rename</b>\n\n"
+                "Send the desired filename <i>(without extension)</i>:\n\n"
+                "Example: <code>Reborn as a Cat S01E20</code>\n\n"
+                "<i>Send /skip to use the automatic name.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        else:
+            asyncio.create_task(
+                _launch_download(client, cb.message, url, uid, audio_only=audio_only)
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -891,6 +922,7 @@ async def _launch_download(
     uid: int,
     audio_only: bool = False,
     fmt_id: str | None = None,
+    custom_name: str | None = None,
 ) -> None:
     tmp = make_tmp(cfg.download_dir, uid)
 
@@ -975,8 +1007,15 @@ async def _launch_download(
     s = await _settings.get(uid)
 
     fname    = os.path.basename(path)
-    cleaned  = smart_clean_filename(fname)          # strip technical noise
-    name, ext = os.path.splitext(cleaned)
+    _orig_ext = os.path.splitext(fname)[1]          # keep original extension
+
+    if custom_name:
+        # Manual rename: use exactly what the user typed + original extension
+        cleaned = custom_name.strip()
+        name, ext = cleaned, _orig_ext
+    else:
+        cleaned  = smart_clean_filename(fname)      # strip technical noise
+        name, ext = os.path.splitext(cleaned)
 
     prefix = s.get("prefix", "").strip()
     suffix = s.get("suffix", "").strip()
@@ -1116,3 +1155,47 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             [InlineKeyboardButton("🎬 Download", callback_data=f"dl|video|{token}")],
                             [InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
                         ]))
+
+
+# ─────────────────────────────────────────────────────────────
+# Manual rename collector
+# Intercepts the user's reply when rename_mode == "manual"
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(
+    filters.private & filters.text & ~filters.command(
+        ["start","help","settings","info","status","log","restart",
+         "broadcast","admin","ban_user","unban_user","banned_list",
+         "cancel","show_thumb","del_thumb","json_formatter","bulk_url"]
+    ),
+    group=4,   # runs before url_handler (group=5) so it captures the text first
+)
+async def rename_collector(client: Client, msg: Message):
+    uid = msg.from_user.id
+    if uid not in _rename_pending:
+        return
+
+    pending = _rename_pending.pop(uid)
+    text    = msg.text.strip()
+
+    # /skip → fall back to auto naming
+    custom_name = None if text.lower() in ("/skip", "skip") else text
+
+    panel_msg = pending["msg"]
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    asyncio.create_task(
+        _launch_download(
+            client,
+            panel_msg,
+            pending["url"],
+            uid,
+            audio_only=pending.get("audio_only", False),
+            fmt_id=pending.get("fmt_id"),
+            custom_name=custom_name,
+        )
+    )
+    msg.stop_propagation()
