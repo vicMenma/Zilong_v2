@@ -10,7 +10,6 @@ Change vs original:
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import re
 import time
@@ -19,7 +18,6 @@ from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
 import aiohttp
-import aria2p
 import yt_dlp
 
 from core.config import cfg
@@ -274,6 +272,39 @@ async def download_gdrive(
 
 
 # ── Aria2 (magnet / torrent) ──────────────────────────────────
+# Approach from reference bot (zilong-main):
+# Run aria2c as a subprocess and read its stdout line-by-line in real-time.
+# This gives instant progress updates instead of 2s API polling gaps,
+# and correctly shows the metadata phase from the very first second.
+
+import re as _re
+
+_ARIA2_PROG_RE = _re.compile(
+    r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\)"
+    r"(?:.*?DL:([\d.]+\w+))?(?:.*?ETA:([\dhms]+))?"
+)
+
+
+def _aria2_bytes(s: str) -> int:
+    """Convert aria2c size string '12.5MiB' → bytes."""
+    units = {"b":1,"kib":1024,"mib":1024**2,"gib":1024**3,
+             "kb":1000,"mb":1000**2,"gb":1000**3}
+    m = _re.match(r"([\d.]+)\s*(\w+)", s.strip(), _re.I)
+    if not m:
+        return 0
+    try:
+        return int(float(m.group(1)) * units.get(m.group(2).lower(), 1))
+    except Exception:
+        return 0
+
+
+def _aria2_eta(s: str) -> int:
+    """Convert '3m56s' → seconds."""
+    total = 0
+    for v, u in _re.findall(r"(\d+)([hms])", s):
+        total += int(v) * {"h":3600,"m":60,"s":1}.get(u, 0)
+    return total
+
 
 async def download_aria2(
     uri_or_path: str, dest: str,
@@ -281,139 +312,123 @@ async def download_aria2(
     progress: Optional[ProgressCB] = None,
     task_record=None,
 ) -> str:
-
-    api = aria2p.API(aria2p.Client(
-        host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret
-    ))
-
-    aria_opts = {
-        "dir":                        dest,
-        "seed-time":                  "0",
-        "max-connection-per-server":  "16",
-        "split":                      "16",
-        "min-split-size":             "1M",
-        "bt-max-peers":               "200",
-        "follow-torrent":             "mem",
-    }
-
+    """
+    Download via aria2c subprocess — real-time stdout parsing.
+    No aria2p API, no polling gap.
+    """
     if is_file:
-        with open(uri_or_path, "rb") as f:
-            data = f.read()
-        dl = api.add_torrent(base64.b64encode(data).decode(), options=aria_opts)
+        cmd = [
+            "aria2c", "-x16", "--seed-time=0",
+            "--summary-interval=1", "--console-log-level=notice",
+            "--max-tries=3", "-d", dest,
+            f"--torrent-file={uri_or_path}",
+        ]
     else:
-        dl = api.add_magnet(uri_or_path, options=aria_opts)
+        cmd = [
+            "aria2c", "-x16", "--seed-time=0",
+            "--bt-max-peers=200",
+            "--summary-interval=1", "--console-log-level=notice",
+            "--max-tries=3", "-d", dest,
+            uri_or_path,
+        ]
 
-    # ── Phase 1: metadata fetch ───────────────────────────────
-    # Fix B: set meta_phase=True IMMEDIATELY so the panel shows the right
-    # state from the very first render — not "⏳ Queued — waiting for a slot".
-    if task_record is not None:
+    # Set meta_phase immediately for magnets so panel shows correct state
+    if task_record is not None and not is_file:
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
         try:
-            from services.task_runner import runner as _runner
-            _runner._wake_panel(task_record.user_id)
+            from services.task_runner import runner as _r
+            _r._wake_panel(task_record.user_id)
         except Exception:
             pass
 
-    meta_start = time.time()
-    for tick in range(120):
-        await asyncio.sleep(1)
-        elapsed = time.time() - meta_start
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
-        try:
-            dl = api.get_download(dl.gid)
-        except Exception as exc:
-            # Fix D: don't skip the record update on exception — keep the
-            # metadata state visible so the user knows we're still trying.
+    start     = time.time()
+    last_wake = [start]
+    in_meta   = [task_record is not None and not is_file]
+
+    def _wake(uid: int) -> None:
+        now = time.time()
+        if now - last_wake[0] >= 1.0:
+            last_wake[0] = now
+            try:
+                from services.task_runner import runner as _r
+                _r._wake_panel(uid)
+            except Exception:
+                pass
+
+    assert proc.stdout is not None
+    async for raw in proc.stdout:
+        line = raw.decode(errors="replace").strip()
+        if not line:
+            continue
+
+        elapsed = time.time() - start
+
+        # ── Progress line ─────────────────────────────────────
+        m = _ARIA2_PROG_RE.search(line)
+        if m:
+            done_b  = _aria2_bytes(m.group(1) or "0")
+            total_b = _aria2_bytes(m.group(2) or "0")
+            spd_b   = _aria2_bytes(m.group(4) or "0") if m.group(4) else 0
+            eta_sec = _aria2_eta(m.group(5) or "") if m.group(5) else 0
+
+            if in_meta[0]:
+                in_meta[0] = False
+                # Try to get the actual filename once data starts flowing
+                fname_now = largest_file(dest)
+                fname_s   = os.path.basename(fname_now)[:40] if fname_now else ""
+                if task_record is not None:
+                    task_record.update(
+                        meta_phase=False, state="📥 Downloading",
+                        **({"label": fname_s, "fname": fname_s} if fname_s else {}),
+                    )
+
             if task_record is not None:
                 task_record.update(
-                    meta_phase=True,
-                    state=f"🔍 Metadata… (retry {tick+1})",
-                    elapsed=elapsed,
+                    done=done_b, total=total_b,
+                    speed=float(spd_b), eta=eta_sec,
+                    elapsed=elapsed, state="📥 Downloading",
                 )
-                try:
-                    from services.task_runner import runner as _runner
-                    _runner._wake_panel(task_record.user_id)
-                except Exception:
-                    pass
-            continue
+                _wake(task_record.user_id)
 
-        if dl.error_message:
-            raise RuntimeError(f"aria2c: {dl.error_message}")
+            if progress:
+                await progress(done_b, total_b, float(spd_b), eta_sec)
 
-        # Fix A: call _wake_panel on EVERY successful Phase 1 update
-        if task_record is not None:
+        # ── Still in metadata phase — tick the elapsed counter ─
+        elif in_meta[0] and task_record is not None:
             task_record.update(
-                meta_phase=True,
-                state="🔍 Fetching metadata…",
-                elapsed=elapsed,
+                meta_phase=True, state="🔍 Fetching metadata…", elapsed=elapsed,
             )
-            try:
-                from services.task_runner import runner as _runner
-                _runner._wake_panel(task_record.user_id)
-            except Exception:
-                pass
+            _wake(task_record.user_id)
 
-        if dl.name and dl.name not in ("Unknown", ""):
-            break
+    await proc.wait()
+
+    if proc.returncode not in (0, None):
+        err = b""
+        if proc.stderr:
+            err = await proc.stderr.read()
+        raise RuntimeError(
+            f"aria2c exited {proc.returncode}: {err.decode(errors='replace')[-300:]}"
+        )
 
     if task_record is not None:
-        task_record.update(
-            meta_phase=False,
-            state="📥 Downloading",
-            label=dl.name[:40] if dl.name else task_record.label,
-            fname=dl.name[:40] if dl.name else task_record.fname,
-        )
+        task_record.update(state="✅ Done", done=task_record.total or task_record.done)
         try:
-            from services.task_runner import runner as _runner
-            _runner._wake_panel(task_record.user_id)
+            from services.task_runner import runner as _r
+            _r._wake_panel(task_record.user_id)
         except Exception:
             pass
 
-    # ── Phase 2: actual download ──────────────────────────────
-    dl_start = time.time()
-    while True:
-        await asyncio.sleep(2)
-        try:
-            dl = api.get_download(dl.gid)
-        except Exception:
-            await asyncio.sleep(5)
-            continue
-        if dl.error_message:
-            raise RuntimeError(f"aria2c: {dl.error_message}")
-        if dl.is_complete:
-            break
-
-        total    = dl.total_length     or 0
-        done     = dl.completed_length or 0
-        speed    = dl.download_speed   or 0.0
-        eta      = int((total - done) / speed) if speed else 0
-        seeds    = getattr(dl, "num_seeders", 0) or 0
-        elapsed  = time.time() - dl_start
-
-        if task_record is not None:
-            task_record.update(
-                done=done, total=total,
-                speed=speed, eta=eta, seeds=seeds,
-                elapsed=elapsed,
-                state="📥 Downloading",
-            )
-            # Wake the panel immediately on each update
-            try:
-                from services.task_runner import runner
-                runner._wake_panel(task_record.user_id)
-            except Exception:
-                pass
-
-        if progress:
-            await progress(done, total, speed, eta)
-
-        if time.time() - dl_start > 3600 * 6:
-            raise TimeoutError("Torrent download timed out (6h)")
-
-    result = largest_file(dl.dir or dest) or largest_file(dest)
+    result = largest_file(dest)
     if not result:
         raise FileNotFoundError("No file found after aria2c download")
     return result
+
 
 
 # ── Smart dispatcher ──────────────────────────────────────────
