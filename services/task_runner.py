@@ -383,15 +383,20 @@ class LivePanel:
         self._wake_ev  = asyncio.Event()
         self._last_edit = 0.0
         self._last_activity = time.time()
+        self._sent_at   = time.time()   # when the panel message was sent
+        self._relocate  = False          # request to delete+resend at bottom
 
     def wake(self, immediate: bool = False) -> None:
         """Wake the panel loop for a re-render.
-        immediate=True resets _last_edit so the 1.0s cooldown is bypassed —
-        use this when a new task arrives and we want instant feedback.
+        immediate=True bypasses the 1.0s cooldown and requests a relocate
+        if the panel message is older than 30 seconds.
         """
         self._last_activity = time.time()
         if immediate:
-            self._last_edit = 0.0   # bypass the 1.0s since-last-edit guard
+            self._last_edit = 0.0
+            # Mark for relocate if panel is >30s old (new task arrived)
+            if time.time() - self._sent_at > 30:
+                self._relocate = True
         self._wake_ev.set()
 
     def start(self) -> None:
@@ -444,6 +449,30 @@ class LivePanel:
             # Track whether we ever had tasks
             if tasks:
                 had_tasks = True
+
+            # Relocate panel to bottom of chat when a new task arrives
+            # and the panel is >30s old. Rate-limited: only if not done recently.
+            if self._relocate and tasks:
+                self._relocate = False
+                try:
+                    from core.session import get_client
+                    from pyrogram import enums
+                    client = get_client()
+                    text = await render_panel(self._uid)
+                    new_msg = await client.send_message(
+                        self._uid, text, parse_mode=enums.ParseMode.HTML,
+                    )
+                    try:
+                        await self._msg.delete()
+                    except Exception:
+                        pass
+                    self._msg      = new_msg
+                    self._last_txt = text
+                    self._last_edit = time.time()
+                    self._sent_at   = time.time()
+                    continue
+                except Exception as exc:
+                    log.debug("LivePanel relocate uid=%d: %s", self._uid, exc)
 
             # Only delete when ALL tasks are gone from memory (evicted after TASK_LINGER)
             # This ensures we never delete mid-download or between download→upload
@@ -541,32 +570,51 @@ class TaskRunner:
 
     async def auto_panel(self, uid: int) -> None:
         async with self._panel_lock(uid):
-            # Always stop the old panel and delete its message so the new panel
-            # appears at the BOTTOM of the chat, near the user's latest message.
-            # This is the reference-bot behaviour — the panel follows the conversation.
-            old = self._panels.pop(uid, None)
-            if old:
-                old.stop()
+            existing = self._panels.get(uid)
+
+            # Reuse existing panel if it's still alive and was sent recently.
+            # This prevents FLOOD_WAIT: download task + upload task both call
+            # auto_panel within seconds — without this guard we'd send two new
+            # panel messages in rapid succession and get Telegram flood-banned.
+            if existing and not existing._stopped:
+                existing.wake(immediate=True)
+                return
+
+            # Stop the old dead panel and delete its message
+            if existing:
+                existing.stop()
                 try:
-                    await old._msg.delete()
+                    await existing._msg.delete()
                 except Exception:
                     pass
+                self._panels.pop(uid, None)
 
-            try:
-                from core.session import get_client
-                from pyrogram import enums
-                client = get_client()
-                initial_text = await render_panel(uid)
-                msg = await client.send_message(
-                    uid,
-                    initial_text,
-                    parse_mode=enums.ParseMode.HTML,
-                )
-                new_panel = LivePanel(msg, uid=uid)
-                self._panels[uid] = new_panel
-                new_panel.start()
-            except Exception as exc:
-                log.warning("auto_panel uid=%d failed: %s", uid, exc)
+            # Send a fresh panel — handle FloodWait by waiting then retrying once
+            for attempt in range(2):
+                try:
+                    from core.session import get_client
+                    from pyrogram import enums
+                    from pyrogram.errors import FloodWait
+                    client = get_client()
+                    initial_text = await render_panel(uid)
+                    msg = await client.send_message(
+                        uid,
+                        initial_text,
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                    new_panel = LivePanel(msg, uid=uid)
+                    self._panels[uid] = new_panel
+                    new_panel.start()
+                    return
+                except FloodWait as fw:
+                    if attempt == 0:
+                        log.warning("auto_panel FloodWait %ds — waiting", fw.value)
+                        await asyncio.sleep(fw.value)
+                    else:
+                        log.warning("auto_panel uid=%d FloodWait on retry — skipping", uid)
+                except Exception as exc:
+                    log.warning("auto_panel uid=%d failed: %s", uid, exc)
+                    return
 
     def close_panel(self, uid: int) -> None:
         p = self._panels.pop(uid, None)
