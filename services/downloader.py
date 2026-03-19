@@ -554,4 +554,6 @@ async def _dispatch(
     if kind == "ytdlp":
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
-    return await download_direct(url, dest, progress)
+    # All remaining direct HTTP/HTTPS links go through aria2c:
+    # multi-connection (-x16), auto-retry, resume support — better than single-stream aiohttp
+    return await download_aria2(url, dest, is_file=False, progress=progress, task_record=task_record)
