@@ -135,22 +135,27 @@ async def upload_file(
 
     start      = time.time()
     last_panel = [start]
+    # Throttle: only update the TaskRecord/panel at most once per second.
+    # pyrogram fires _progress on every 512 KiB chunk — at 50 MB/s that is
+    # ~100 calls/sec.  Each call would hit record.update() + asyncio event
+    # dispatch, adding measurable overhead. With this guard we drop 99% of
+    # those calls without losing any visible accuracy on the progress bar.
+    _PROGRESS_INTERVAL = 1.0  # seconds between panel refreshes
 
     async def _progress(current: int, total: int) -> None:
-        now     = time.time()
+        now = time.time()
+        if now - last_panel[0] < _PROGRESS_INTERVAL:
+            return                  # skip — too soon, no work needed
+        last_panel[0] = now
         elapsed = now - start
         speed   = current / elapsed if elapsed else 0
         eta     = int((total - current) / speed) if speed else 0
-
-        # Update TaskRecord — the panel loop reads this and re-renders
         record.update(
             done=current, total=total,
             speed=speed, eta=eta, elapsed=elapsed,
             state="📤 Uploading",
         )
-        if now - last_panel[0] >= 1.0:
-            last_panel[0] = now
-            runner._wake_panel(chat_id)
+        runner._wake_panel(chat_id)
 
     async def _send() -> None:
         common = dict(

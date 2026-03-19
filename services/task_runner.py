@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -488,19 +489,25 @@ class LivePanel:
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
+    # How many uploads can run concurrently.
+    # The original semaphore=1 was a workaround for a stock pyrogram deadlock
+    # where two concurrent send_video() calls competed for the same single DC
+    # connection.  pyrofork >= 2.3.40 with concurrent_transmissions=N opens N
+    # independent encrypted streams per upload, so each upload manages its own
+    # connection pool internally — the deadlock cannot occur anymore.
+    # 3 is the safe maximum: above this Telegram's MTProto rate-limiter starts
+    # dropping chunks for a single bot token, which actually reduces throughput.
+    _UPLOAD_CONCURRENCY: int = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
+
     def __init__(self) -> None:
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
         self._running       = False
-        # Serialize ALL uploads through one slot.
-        # Pyrogram/pyrofork deadlocks when two large send_video() calls run
-        # simultaneously on the same client — both wait for a connection that
-        # the other is holding.  One upload at a time avoids this entirely.
         self._upload_sem:   asyncio.Semaphore | None = None
 
     def _get_upload_sem(self) -> asyncio.Semaphore:
         if self._upload_sem is None:
-            self._upload_sem = asyncio.Semaphore(1)
+            self._upload_sem = asyncio.Semaphore(self._UPLOAD_CONCURRENCY)
         return self._upload_sem
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
@@ -512,8 +519,8 @@ class TaskRunner:
         self._running = True
         # Pre-create the semaphore on the running event loop
         global _task_semaphore
-        _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        self._upload_sem = asyncio.Semaphore(1)   # one upload at a time
+        _task_semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
+        self._upload_sem = asyncio.Semaphore(self._UPLOAD_CONCURRENCY)
 
     def stop(self) -> None:
         self._running = False
