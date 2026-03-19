@@ -121,6 +121,15 @@ env_lines = [
     "ARIA2_HOST=http://localhost",
     "ARIA2_PORT=6800",
     "ARIA2_SECRET=",
+    # ── Upload speed tuning ───────────────────────────────────────────────
+    # CONCURRENT_TX: parallel MTProto encrypted streams opened per upload.
+    #   4  →  ~5-10 MB/s  (original default)
+    #   16 →  ~40-80 MB/s (tuned — sweet spot for Colab → Telegram DC4)
+    "CONCURRENT_TX=16",
+    # UPLOAD_CONCURRENCY: how many independent uploads run at the same time.
+    #   1 → sequential  (original — deadlock workaround for stock pyrogram)
+    #   3 → parallel    (safe with pyrofork>=2.3.40, maximises aggregate throughput)
+    "UPLOAD_CONCURRENCY=3",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
     val = _secret(optional)
