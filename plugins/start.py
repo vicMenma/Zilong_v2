@@ -61,20 +61,17 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
     prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
     suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
 
-    rename = s.get("rename_mode", "auto")
-    rename_lbl = "✏️ Rename: Manual" if rename == "manual" else "⚙️ Rename: Auto"
-
     rows = [
         [InlineKeyboardButton(prefix_lbl,               callback_data="st_prefix"),
          InlineKeyboardButton("🗑", callback_data="st_clrprefix")],
         [InlineKeyboardButton(suffix_lbl,               callback_data="st_suffix"),
          InlineKeyboardButton("🗑", callback_data="st_clrsuffix")],
-        [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode"),
-         InlineKeyboardButton(rename_lbl,               callback_data="st_rename")],
+        [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode")],
         [InlineKeyboardButton("🖼️ Set Thumbnail",         callback_data="st_thumb"),
          InlineKeyboardButton("🗑️ Clear Thumbnail",       callback_data="st_clearthumb")],
         [InlineKeyboardButton(af_lbl,                    callback_data="st_af_toggle"),
          InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
+        [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')}", callback_data="st_caption")],
         [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -209,15 +206,47 @@ async def cq_st_clear(client: Client, cb: CallbackQuery):
 
 
 
-@Client.on_callback_query(filters.regex("^st_rename$"))
-async def cq_st_rename(client: Client, cb: CallbackQuery):
-    s      = await settings.get(cb.from_user.id)
-    new    = "manual" if s.get("rename_mode", "auto") == "auto" else "auto"
-    await settings.update(cb.from_user.id, {"rename_mode": new})
-    s["rename_mode"] = new
-    await cb.message.edit_reply_markup(_settings_kb(s))
-    label = "Manual ✏️" if new == "manual" else "Auto ⚙️"
-    await cb.answer(f"Rename mode: {label}")
+_CAPTION_STYLES = ["Monospace", "Bold", "Italic", "Plain", "Bold Italic"]
+
+def _caption_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎",  callback_data="st_cap|Monospace"),
+         InlineKeyboardButton("Bold",       callback_data="st_cap|Bold")],
+        [InlineKeyboardButton("Italic",     callback_data="st_cap|Italic"),
+         InlineKeyboardButton("Plain",      callback_data="st_cap|Plain")],
+        [InlineKeyboardButton("Bold Italic",callback_data="st_cap|Bold Italic")],
+        [InlineKeyboardButton("🔙 Back",    callback_data="cb_settings")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+@Client.on_callback_query(filters.regex("^st_caption$"))
+async def cq_st_caption(client: Client, cb: CallbackQuery):
+    s = await settings.get(cb.from_user.id)
+    cur = s.get("caption_style", "Monospace")
+    await cb.message.edit(
+        f"✏️ <b>Caption Style</b>\n\n"
+        f"Current: <b>{cur}</b>\n\n"
+        f"Monospace → <code>filename.mkv</code>\n"
+        f"Bold      → <b>filename.mkv</b>\n"
+        f"Italic    → <i>filename.mkv</i>\n"
+        f"Plain     → filename.mkv\n"
+        f"Bold Italic → <b><i>filename.mkv</i></b>",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=_caption_kb(),
+    )
+    await cb.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^st_cap\|"))
+async def cq_st_cap_pick(client: Client, cb: CallbackQuery):
+    style = cb.data.split("|", 1)[1]
+    await settings.update(cb.from_user.id, {"caption_style": style})
+    s = await settings.get(cb.from_user.id)
+    await cb.message.edit("⚙️ <b>Settings</b>",
+                          reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
+    await cb.answer(f"Caption style: {style} ✅")
 
 
 @Client.on_callback_query(filters.regex("^st_close$"))
