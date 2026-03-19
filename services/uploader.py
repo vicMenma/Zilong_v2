@@ -244,18 +244,12 @@ async def upload_file(
         record.update(state="✅ Done", done=file_size, total=file_size)
         runner._wake_panel(chat_id)
 
-    # Acquire the global upload semaphore BEFORE calling send_video/send_audio/
-    # send_document.  Pyrogram deadlocks when two large uploads run concurrently
-    # on the same client (both wait for a connection the other holds).
-    # One upload at a time — matches the reference bot's sequential loop.
     from services.task_runner import runner as _runner_ul
-    upload_sem = _runner_ul._get_upload_sem()
 
     try:
-        async with upload_sem:
-            record.update(state="📤 Uploading")
-            _runner_ul._wake_panel(chat_id, immediate=True)
-            await _send()
+        record.update(state="📤 Uploading")
+        _runner_ul._wake_panel(chat_id, immediate=True)
+        await _send()
 
         # ── Auto-forward / ask-forward logic ─────────────────────────────────
         sent = _sent_msg[0]
@@ -316,8 +310,7 @@ async def upload_file(
             log.warning("FloodWait %ds — waiting", fw.value)
             record.update(state=f"⏳ FloodWait {fw.value}s")
             await asyncio.sleep(fw.value)
-            async with upload_sem:
-                await _send()
+            await _send()
         else:
             raise
     except Exception as exc:
