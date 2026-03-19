@@ -50,11 +50,20 @@ def _start_kb() -> InlineKeyboardMarkup:
 
 
 def _settings_kb(s: dict) -> InlineKeyboardMarkup:
-    rename = "✅ ON" if s.get("rename_file") else "❌ OFF"
-    mode   = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+    rename      = s.get("rename_file", False)
+    custom_name = s.get("custom_name", "").strip()
+    mode        = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+
+    if rename and custom_name:
+        rename_label = f"✏️ Rename: ✅ → {custom_name[:20]}"
+    elif rename:
+        rename_label = "✏️ Auto-Rename: ✅ (send a name)"
+    else:
+        rename_label = "✏️ Auto-Rename: ❌ OFF"
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✏️ Auto-Rename: {rename}", callback_data="st_rename")],
-        [InlineKeyboardButton(f"📤 Upload Mode: {mode}",   callback_data="st_mode")],
+        [InlineKeyboardButton(rename_label,               callback_data="st_rename")],
+        [InlineKeyboardButton(f"📤 Upload Mode: {mode}",  callback_data="st_mode")],
         [InlineKeyboardButton("🖼️ Set Thumbnail",          callback_data="st_thumb"),
          InlineKeyboardButton("🗑️ Clear Thumbnail",        callback_data="st_clearthumb")],
         [InlineKeyboardButton("❌ Close",                   callback_data="st_close")],
@@ -166,12 +175,31 @@ async def cq_account(client: Client, cb: CallbackQuery):
 
 @Client.on_callback_query(filters.regex("^st_rename$"))
 async def cq_st_rename(client: Client, cb: CallbackQuery):
-    s   = await settings.get(cb.from_user.id)
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
     new = not s.get("rename_file", False)
-    await settings.update(cb.from_user.id, {"rename_file": new})
-    s["rename_file"] = new
-    await cb.message.edit_reply_markup(_settings_kb(s))
-    await cb.answer(f"Auto-Rename: {'ON ✅' if new else 'OFF ❌'}")
+    await settings.update(uid, {"rename_file": new})
+
+    if new:
+        # Mark user as waiting for a rename template reply
+        _RENAME_WAITING.add(uid)
+        await cb.answer("Auto-Rename ON ✅ — send me the name to use")
+        await cb.message.edit(
+            "✏️ <b>Auto-Rename is ON</b>\n\n"
+            "Reply with the <b>filename</b> to use for all future downloads.\n"
+            "<i>The original file extension is kept automatically.</i>\n\n"
+            "Example: <code>My Series S01E01</code>\n\n"
+            "<i>Send /cancel to cancel.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    else:
+        # Turn OFF — clear saved name too
+        await settings.update(uid, {"custom_name": ""})
+        _RENAME_WAITING.discard(uid)
+        s["rename_file"] = False
+        s["custom_name"] = ""
+        await cb.message.edit_reply_markup(_settings_kb(s))
+        await cb.answer("Auto-Rename OFF ❌")
 
 
 @Client.on_callback_query(filters.regex("^st_mode$"))
@@ -203,3 +231,51 @@ async def cq_st_clear(client: Client, cb: CallbackQuery):
 async def cq_st_close(client: Client, cb: CallbackQuery):
     await cb.message.delete()
     await cb.answer()
+
+
+# ── Rename name collector ─────────────────────────────────────────────────────
+# Users who tapped "Auto-Rename ON" are placed in this set.
+# The next plain-text message they send is captured as their rename template.
+_RENAME_WAITING: set[int] = set()
+
+
+@Client.on_message(filters.private & filters.text & ~filters.command(
+    ["start","help","settings","info","status","log","restart","broadcast",
+     "admin","ban_user","unban_user","banned_list","cancel",
+     "show_thumb","del_thumb","json_formatter","bulk_url"]
+), group=8)
+async def rename_name_collector(client: Client, msg: Message):
+    uid = msg.from_user.id
+    if uid not in _RENAME_WAITING:
+        return
+
+    raw_name = msg.text.strip()
+
+    # /cancel → abort rename setup
+    if raw_name.lower() in ("/cancel", "cancel"):
+        _RENAME_WAITING.discard(uid)
+        await settings.update(uid, {"rename_file": False, "custom_name": ""})
+        await msg.reply("❌ Auto-Rename cancelled.")
+        msg.stop_propagation()
+        return
+
+    # Strip any extension the user accidentally included
+    import os as _os
+    name_no_ext = _os.path.splitext(raw_name)[0].strip()
+    if not name_no_ext:
+        await msg.reply("❌ Name cannot be empty. Try again or send /cancel.")
+        return
+
+    _RENAME_WAITING.discard(uid)
+    await settings.update(uid, {"custom_name": name_no_ext})
+
+    s = await settings.get(uid)
+    await msg.reply(
+        f"✅ <b>Auto-Rename set!</b>\n\n"
+        f"Every downloaded file will be renamed to:\n"
+        f"<code>{name_no_ext}.[original_ext]</code>\n\n"
+        f"<i>Tap Auto-Rename again in /settings to change or turn off.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+    msg.stop_propagation()
+

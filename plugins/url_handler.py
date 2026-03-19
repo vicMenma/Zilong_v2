@@ -858,6 +858,10 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 # Upload helper — runs as independent task
 # ─────────────────────────────────────────────────────────────
 
+# uid → {path, tmp, ext} — waiting for user to type a rename
+_pending_rename: dict[int, dict] = {}
+
+
 async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
     try:
         await upload_file(client, msg, path)
@@ -966,6 +970,24 @@ async def _launch_download(
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
+
+    # ── Apply auto-rename from user settings ──────────────────────────────────
+    from core.session import settings as _settings
+    user_settings = await _settings.get(uid)
+    if user_settings.get("rename_file") and user_settings.get("custom_name", "").strip():
+        import os as _os
+        custom_name = user_settings["custom_name"].strip()
+        orig_ext    = _os.path.splitext(path)[1]          # keep original extension
+        new_name    = f"{custom_name}{orig_ext}"
+        new_path    = _os.path.join(_os.path.dirname(path), new_name)
+        try:
+            _os.rename(path, new_path)
+            path = new_path
+            log.info("Auto-rename: %s → %s", _os.path.basename(path), new_name)
+        except OSError as _e:
+            log.warning("Auto-rename failed: %s", _e)
+    # ─────────────────────────────────────────────────────────────────────────
+
     asyncio.create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
 
 
