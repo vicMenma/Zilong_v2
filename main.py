@@ -42,8 +42,9 @@ for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
     except OSError:
         pass
 
-from pyrogram import Client, idle
+from pyrogram import Client, idle, filters, handlers, enums
 from core.config import cfg
+from core.bot_name import get_bot_name, set_bot_name, is_name_configured
 from services.task_runner import runner
 
 
@@ -64,20 +65,64 @@ def build_client() -> Client:
         plugins={"root": "plugins"},
         workdir="/tmp",
     )
+    # Add workers only if the parameter exists (it does in all known pyrofork versions)
     sig = inspect.signature(Client.__init__)
     if "workers" in sig.parameters:
         kwargs["workers"] = _WORKERS
         log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
-    # concurrent_transmissions: pyrofork opens N independent encrypted MTProto
-    # streams per upload — each stream handles its own chunk concurrently.
-    # This is the correct way to get parallel uploads in pyrofork >= 2.3.x
-    # (the save_file patch no longer works as that function was removed).
     if "max_concurrent_transmissions" in sig.parameters:
         ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
         kwargs["max_concurrent_transmissions"] = ct
         log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", ct)
     return Client(**kwargs)
 
+
+
+async def _ask_bot_name(client) -> None:
+    """
+    Interactively ask the owner for a bot name on first launch.
+    Registers a one-shot private-message handler, waits up to 5 minutes,
+    then removes the handler and persists the chosen name.
+    """
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    async def _on_name(_, msg):
+        name = msg.text.strip()
+        if name and not fut.done():
+            fut.set_result(name)
+
+    handler = handlers.MessageHandler(
+        _on_name,
+        filters.user(cfg.owner_id) & filters.text & filters.private,
+    )
+    client.add_handler(handler, group=-99)
+
+    try:
+        await client.send_message(
+            cfg.owner_id,
+            "👋 <b>First-time setup</b>\n\n"
+            "What do you want to call this bot?\n"
+            "Send me just the name — for example: <code>Kitagawa</code>\n\n"
+            "The progress panel will then show:\n"
+            "<b>⚡️ KITAGAWA MULTIUSAGE BOT</b>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        name = await asyncio.wait_for(fut, timeout=300)
+    except asyncio.TimeoutError:
+        log.warning("Bot-name setup timed out — using default Zilong")
+        name = "Zilong"
+    finally:
+        client.remove_handler(handler, group=-99)
+
+    set_bot_name(name)
+    display = name.title() + " Multiusage Bot"
+    await client.send_message(
+        cfg.owner_id,
+        f"✅ Name saved! The panel will now show:\n<b>⚡️ {display.upper()}</b>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+    log.info("Bot name configured: %s", name)
 
 async def main() -> None:
     # ── Koyeb health server ────────────────────────────────────
@@ -99,6 +144,10 @@ async def main() -> None:
 
     runner.start()
     log.info("🚀 Task runner started (max %d concurrent)", 5)
+
+    # ── First-launch: ask owner for a bot name ─────────────────
+    if not is_name_configured():
+        await _ask_bot_name(client)
 
     log.info("📡 Bot is running. Press Ctrl+C to stop.")
     await idle()
