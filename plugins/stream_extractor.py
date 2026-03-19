@@ -505,12 +505,10 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
 
         ext = rec.get("ext", "mkv")
         fname_base = session["title"].replace("/", "_").replace(" ", "_")[:40]
-        lang  = rec.get("lang", "und")
-        # derive stype from the rec (audio / subtitle / video)
-        _rtype = rec.get("type", "video")
-        _stype_map = {"audio": "audio", "subs": "subtitle", "video": "video"}
-        _stype = _stype_map.get(_rtype, "video")
-        out = _stream_fname(tmp, _stype, lang, idx, f".{ext}")
+        lang   = rec.get("lang", "und")
+        # stype is already "v" / "a" / "s" from the callback data
+        _stype = {"v": "video", "a": "audio", "s": "subtitle"}.get(stype, "video")
+        out    = _stream_fname(tmp, _stype, lang, idx, f".{ext}")
 
         await safe_edit(st, f"⬇️ Downloading & extracting stream #{idx} via ffmpeg…")
 
