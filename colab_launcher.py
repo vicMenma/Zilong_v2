@@ -86,6 +86,14 @@ if r.returncode != 0:
 _log("OK", f"Cloned to {BASE_DIR}")
 
 _log("STEP", "Installing Python packages…")
+# Remove stock pyrogram before installing pyrofork — both expose the same
+# `pyrogram` namespace but stock pyrogram lacks pyrofork-only parameters
+# (e.g. concurrent_transmissions).  If both are installed, whichever was
+# imported first wins, and stock pyrogram wins in Colab's default env.
+subprocess.run(
+    [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
+    capture_output=True,  # silence "not installed" warnings
+)
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q",
      "-r", f"{BASE_DIR}/requirements.txt"],

@@ -1,4 +1,6 @@
-pyrofork==2.3.38
+# pyrofork>=2.3.40 added concurrent_transmissions (parallel MTProto upload slots).
+# Pin to a known-good range; the bot gracefully falls back if an older build is used.
+pyrofork>=2.3.40
 TgCrypto
 aiohttp
 yt-dlp

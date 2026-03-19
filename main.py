@@ -34,18 +34,35 @@ from services.task_runner import runner
 
 
 def build_client() -> Client:
-    return Client(
+    import inspect
+
+    base_kwargs: dict = dict(
         name="ZilongBot",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
         bot_token=cfg.bot_token,
         plugins={"root": "plugins"},
         workdir="/tmp",
-        # Upload speed tuning: upload 4 MTProto parts (512 KiB each) in parallel
-        # instead of sequentially. This gives ~4-10x throughput improvement:
-        # default ~2 MB/s → ~10-20 MB/s on Colab → Telegram DC4.
-        concurrent_transmissions=4,
     )
+
+    # concurrent_transmissions was introduced in pyrofork ≥ 2.3.40.
+    # Guard against older installs so the bot never crashes on startup
+    # due to a missing parameter — it simply falls back to sequential transfers.
+    try:
+        sig = inspect.signature(Client.__init__)
+        if "concurrent_transmissions" in sig.parameters:
+            base_kwargs["concurrent_transmissions"] = 4
+            log.info("⚡ concurrent_transmissions=4 enabled (parallel MTProto uploads)")
+        else:
+            log.warning(
+                "⚠️  concurrent_transmissions not supported by this pyrofork build "
+                "— falling back to sequential uploads. "
+                "Upgrade to pyrofork>=2.3.40 for faster upload speed."
+            )
+    except Exception:
+        pass  # inspect failed — proceed without the param
+
+    return Client(**base_kwargs)
 
 
 async def main() -> None:
