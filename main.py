@@ -145,6 +145,31 @@ async def main() -> None:
     runner.start()
     log.info("🚀 Task runner started (max %d concurrent)", 5)
 
+    # ── CloudConvert webhook server ────────────────────────────
+    if cfg.ngrok_token:
+        import services.cloudconvert_hook as cc_hook
+        if cfg.cc_webhook_secret:
+            cc_hook.WEBHOOK_SECRET = cfg.cc_webhook_secret
+        webhook_url = await cc_hook.start_webhook_server(
+            port=8765, ngrok_token=cfg.ngrok_token,
+        )
+        if webhook_url:
+            try:
+                await client.send_message(
+                    cfg.owner_id,
+                    f"☁️ <b>CloudConvert Webhook Ready</b>\n"
+                    f"──────────────────────\n\n"
+                    f"📡 <b>URL:</b>\n<code>{webhook_url}</code>\n\n"
+                    f"Paste this into CloudConvert → API → Webhooks\n"
+                    f"Event: <code>job.finished</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            except Exception as exc:
+                log.warning("Could not send webhook URL to owner: %s", exc)
+        log.info("☁️ CloudConvert webhook started: %s", webhook_url or "localhost only")
+    else:
+        log.info("ℹ️ No NGROK_TOKEN — CloudConvert webhook disabled")
+
     # ── First-launch: ask owner for a bot name ─────────────────
     if not is_name_configured():
         await _ask_bot_name(client)
@@ -153,6 +178,13 @@ async def main() -> None:
     await idle()
 
     log.info("👋 Shutting down…")
+    # Stop CloudConvert webhook if running
+    if cfg.ngrok_token:
+        try:
+            from services.cloudconvert_hook import stop_webhook_server
+            await stop_webhook_server()
+        except Exception:
+            pass
     runner.stop()
     await client.stop()
     log.info("✅ Shutdown complete.")
@@ -160,4 +192,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

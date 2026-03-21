@@ -12,6 +12,10 @@ OWNER_ID  = 0      # @param {type:"integer"}
 FILE_LIMIT_MB = 2048   # @param {type:"integer"}
 LOG_CHANNEL   = 0      # @param {type:"integer"}
 
+# CloudConvert auto-upload (optional)
+NGROK_TOKEN       = ""  # @param {type:"string"}
+CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
+
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
@@ -54,6 +58,8 @@ if not FILE_LIMIT_MB:
 if not LOG_CHANNEL:
     try: LOG_CHANNEL = int(_secret("LOG_CHANNEL") or 0)
     except: LOG_CHANNEL = 0
+if not NGROK_TOKEN:       NGROK_TOKEN       = _secret("NGROK_TOKEN")
+if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 
 errors = []
 if not API_ID:    errors.append("API_ID is required")
@@ -67,6 +73,8 @@ if errors:
     raise SystemExit("Fill in credentials and run again.")
 
 _log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
+if NGROK_TOKEN:
+    _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
 
 _log("STEP", "Installing system packages…")
 subprocess.run(
@@ -120,6 +128,9 @@ env_lines = [
     "ARIA2_HOST=http://localhost",
     "ARIA2_PORT=6800",
     "ARIA2_SECRET=",
+    # ── CloudConvert webhook ──────────────────────────────────────────────
+    f"NGROK_TOKEN={NGROK_TOKEN}",
+    f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     # ── Upload speed tuning ───────────────────────────────────────────────
     # UPLOAD_CONCURRENCY: simultaneous independent file uploads (was 1 = sequential)
     "UPLOAD_CONCURRENCY=3",
