@@ -61,6 +61,12 @@ class Config:
     # File size cap (bytes) — single flat limit, no tiers
     file_limit_mb: int = field(default_factory=lambda: _int_env("FILE_LIMIT_MB", 2048))
 
+    # CloudConvert webhook integration (optional)
+    ngrok_token: str = field(default_factory=lambda:
+        os.environ.get("NGROK_TOKEN", ""))
+    cc_webhook_secret: str = field(default_factory=lambda:
+        os.environ.get("CC_WEBHOOK_SECRET", ""))
+
     @property
     def file_limit_b(self) -> int:
         return self.file_limit_mb * 1024 * 1024
