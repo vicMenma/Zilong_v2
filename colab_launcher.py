@@ -208,9 +208,46 @@ except Exception as _e:
     _log("WARN", f"Patch failed: {_e}")
 
 os.chdir(BASE_DIR)
+
+# ── Keep Colab alive ──────────────────────────────────────────
+# Two tricks to prevent Colab from killing the runtime:
+#   1. JavaScript: clicks the "connect" button every 60s (prevents idle disconnect)
+#   2. Heartbeat thread: prints a dot every 5 min so stdout stays active
+_log("STEP", "Activating Colab keep-alive…")
+try:
+    from IPython.display import display, Javascript
+    display(Javascript('''
+    function ColabKeepAlive() {
+        // Try multiple selectors — Colab changes its DOM occasionally
+        document.querySelector("#top-toolbar .colab-connect-button")?.click();
+        document.querySelector("colab-connect-button")?.shadowRoot
+            ?.querySelector("#connect")?.click();
+        // Also prevent the "runtime disconnected" dialog
+        document.querySelector("#ok")?.click();
+    }
+    setInterval(ColabKeepAlive, 60000);
+    console.log("Colab keep-alive: clicking connect every 60s");
+    '''))
+    _log("OK", "JS keep-alive injected (clicks connect every 60s)")
+except Exception:
+    _log("WARN", "Not in Colab notebook — JS keep-alive skipped")
+
+import threading
+
+def _heartbeat():
+    """Print a silent heartbeat every 5 min to keep stdout active."""
+    while True:
+        time.sleep(300)
+        ts = datetime.now().strftime("%H:%M")
+        print(f"[{ts}] 💓", end="", flush=True)
+
+_hb = threading.Thread(target=_heartbeat, daemon=True)
+_hb.start()
+_log("OK", "Heartbeat thread started (every 5 min)")
+
 _log("OK", "Starting bot…\n" + "─" * 50)
 
-MAX_RESTARTS = 10
+MAX_RESTARTS = 50  # only counts fast crashes (<5 min) — long-running crashes reset the counter
 restart_count = 0
 
 while restart_count < MAX_RESTARTS:
@@ -230,6 +267,10 @@ while restart_count < MAX_RESTARTS:
     if proc.returncode == 0:
         _log("OK", "Bot stopped cleanly.")
         break
+
+    # If bot ran >5 min before crashing, it's not a startup bug — reset counter
+    if elapsed > 300:
+        restart_count = 0
 
     restart_count += 1
     _log("WARN", f"Crashed (exit={proc.returncode}) after {elapsed}s  [{restart_count}/{MAX_RESTARTS}]")
