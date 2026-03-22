@@ -92,7 +92,15 @@ async def _submit_to_cloudconvert(
 
     try:
         api_key = os.environ.get("CC_API_KEY", "").strip()
-        from services.cloudconvert_api import submit_hardsub
+        from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
+
+        # Show key selection info
+        keys = parse_api_keys(api_key)
+        if len(keys) > 1:
+            selected, credits = await pick_best_key(keys)
+            key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits left)"
+        else:
+            key_info = "🔑 1 API key"
 
         job_id = await submit_hardsub(
             api_key,
@@ -117,7 +125,8 @@ async def _submit_to_cloudconvert(
             f"💬 <code>{sub_fname[:38]}</code>\n"
             f"📐 <b>{res_label}</b>\n"
             f"📦 → <code>{output_name[:38]}</code>\n"
-            f"⚙️ {mode_s}\n\n"
+            f"⚙️ {mode_s}\n"
+            f"{key_info}\n\n"
             "⏳ <i>CloudConvert is processing…\n"
             "The webhook will auto-upload the result to this chat.</i>",
             parse_mode=enums.ParseMode.HTML,
