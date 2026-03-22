@@ -1,15 +1,18 @@
 """
 services/cloudconvert_api.py
-CloudConvert API v2 client — specifically for hardsubbing video + subtitle.
+CloudConvert API v2 client — hardsubbing with multi-key rotation.
+
+Multi-API key support:
+  Set CC_API_KEY to a comma-separated list of keys:
+    CC_API_KEY=eyJ...key1,eyJ...key2,eyJ...key3
+  The bot checks remaining credits on each key via GET /v2/users/me
+  and picks the one with the most minutes available. Exhausted keys are skipped.
 
 Flow:
-  1. Create a job with: import-video, import-subtitle, command (ffmpeg hardsub), export
-  2. Upload video + subtitle to the import tasks
-  3. Webhook (already in cloudconvert_hook.py) handles the finished export
-
-Uses the `command` task type for full FFmpeg control:
-  ffmpeg -i /input/import-video/<file> -vf subtitles=/input/import-sub/<file> \
-         -c:v libx264 -crf 20 -preset medium -c:a copy /output/<output>.mp4
+  1. Pick best API key (most credits remaining)
+  2. Create a job with: import-video, import-subtitle, command (ffmpeg hardsub), export
+  3. Upload video + subtitle to the import tasks
+  4. Webhook (already in cloudconvert_hook.py) handles the finished export
 """
 from __future__ import annotations
 
@@ -24,6 +27,83 @@ log = logging.getLogger(__name__)
 
 CC_API = "https://api.cloudconvert.com/v2"
 
+
+# ─────────────────────────────────────────────────────────────
+# Multi-key credit checking & rotation
+# ─────────────────────────────────────────────────────────────
+
+def parse_api_keys(raw: str) -> list[str]:
+    """Parse comma-separated API keys from env var."""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+async def check_credits(api_key: str) -> int:
+    """
+    Check remaining conversion credits for a single API key.
+    Returns credits (minutes) remaining, or -1 on error.
+    GET /v2/users/me → {"data": {"credits": 4434, ...}}
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(f"{CC_API}/users/me", headers=headers) as resp:
+                if resp.status != 200:
+                    log.warning("[CC-API] Credit check failed: HTTP %d", resp.status)
+                    return -1
+                data = await resp.json()
+                credits = data.get("data", {}).get("credits", 0)
+                return int(credits)
+    except Exception as exc:
+        log.warning("[CC-API] Credit check error: %s", exc)
+        return -1
+
+
+async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
+    """
+    Check credits on all keys concurrently, return the one with most credits.
+    Returns (best_key, credits). Raises RuntimeError if all keys exhausted.
+    """
+    if len(api_keys) == 1:
+        credits = await check_credits(api_keys[0])
+        if credits == 0:
+            raise RuntimeError(
+                "CloudConvert: 0 credits remaining on your only API key.\n"
+                "Wait for daily reset or add more keys (comma-separated in CC_API_KEY)."
+            )
+        # credits == -1 means check failed — try anyway, CC will reject if truly empty
+        return api_keys[0], max(credits, 0)
+
+    # Check all keys concurrently
+    tasks = [check_credits(key) for key in api_keys]
+    results = await asyncio.gather(*tasks)
+
+    best_key = ""
+    best_credits = -1
+    status_lines = []
+
+    for key, credits in zip(api_keys, results):
+        short = key[-8:]
+        status_lines.append(f"  ...{short}: {credits} credits")
+        if credits > best_credits:
+            best_credits = credits
+            best_key = key
+
+    log.info("[CC-API] Key rotation — %d keys checked:\n%s",
+             len(api_keys), "\n".join(status_lines))
+
+    if best_credits <= 0:
+        raise RuntimeError(
+            f"CloudConvert: all {len(api_keys)} API keys exhausted (0 credits).\n"
+            "Wait for daily reset or add more keys."
+        )
+
+    log.info("[CC-API] Selected key ...%s (%d credits remaining)", best_key[-8:], best_credits)
+    return best_key, best_credits
+
+
+# ─────────────────────────────────────────────────────────────
+# Job creation
+# ─────────────────────────────────────────────────────────────
 
 async def create_hardsub_job(
     api_key: str,
@@ -43,16 +123,12 @@ async def create_hardsub_job(
       - video_url set     → CloudConvert fetches the video via import/url
       - video_url is None → returns an import/upload task (caller must upload)
 
-    Subtitle is always import/upload (small file, fast upload).
-
     Returns the full job response dict including task IDs and upload URLs.
     """
-    # Sanitise filenames for FFmpeg path safety
     v_safe = video_filename.replace("'", "\\'").replace(" ", "_")
     s_safe = subtitle_filename.replace("'", "\\'").replace(" ", "_")
     o_safe = output_filename.replace("'", "\\'").replace(" ", "_")
 
-    # Build tasks
     tasks: dict = {}
 
     # ── Import video ──────────────────────────────────────────
@@ -73,20 +149,11 @@ async def create_hardsub_job(
     }
 
     # ── FFmpeg hardsub command ────────────────────────────────
-    # Uses the `command` task for full FFmpeg control.
-    # /input/<task-name>/<filename> is how CC maps imported files.
-    # /output/<filename> is where the result goes.
-    #
-    # The subtitles filter in FFmpeg needs the file path escaped
-    # with colons and backslashes for the filtergraph.
     sub_path = f"/input/import-sub/{s_safe}"
-    # Escape for FFmpeg subtitles filter: colons and backslashes
     sub_escaped = sub_path.replace("\\", "\\\\").replace(":", "\\:")
 
     # Build -vf filter chain: optional scale + subtitles
     if scale_height > 0:
-        # Scale first (so subtitles render at the target resolution),
-        # -2 keeps width divisible by 2 for h264
         vf = f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
     else:
         vf = f"subtitles='{sub_escaped}'"
@@ -114,7 +181,6 @@ async def create_hardsub_job(
         "input": ["hardsub"],
     }
 
-    # ── Create the job ────────────────────────────────────────
     payload = {
         "tasks": tasks,
         "tag": "zilong-hardsub",
@@ -138,8 +204,11 @@ async def create_hardsub_job(
     return job
 
 
+# ─────────────────────────────────────────────────────────────
+# File upload helpers
+# ─────────────────────────────────────────────────────────────
+
 def _find_task(job: dict, name: str) -> Optional[dict]:
-    """Find a task by name in the job response."""
     for task in job.get("tasks", []):
         if task.get("name") == name:
             return task
@@ -147,14 +216,12 @@ def _find_task(job: dict, name: str) -> Optional[dict]:
 
 
 def get_upload_url(task: dict) -> Optional[str]:
-    """Extract the upload URL from an import/upload task."""
     result = task.get("result") or {}
     form = result.get("form") or {}
     return form.get("url")
 
 
 def get_upload_params(task: dict) -> dict:
-    """Extract the upload form parameters from an import/upload task."""
     result = task.get("result") or {}
     form = result.get("form") or {}
     return form.get("parameters") or {}
@@ -165,11 +232,6 @@ async def upload_file_to_task(
     file_path: str,
     filename: Optional[str] = None,
 ) -> None:
-    """
-    Upload a local file to a CloudConvert import/upload task.
-
-    Uses multipart form upload with the parameters from the task result.
-    """
     url = get_upload_url(task)
     params = get_upload_params(task)
 
@@ -181,10 +243,8 @@ async def upload_file_to_task(
     log.info("[CC-API] Uploading %s (%s bytes) to %s", fname, fsize, url[:60])
 
     data = aiohttp.FormData()
-    # All form parameters must come before the file
     for key, value in params.items():
         data.add_field(key, str(value))
-    # File must be the last field
     data.add_field(
         "file",
         open(file_path, "rb"),
@@ -202,6 +262,10 @@ async def upload_file_to_task(
     log.info("[CC-API] Upload complete: %s", fname)
 
 
+# ─────────────────────────────────────────────────────────────
+# High-level submit (with auto key rotation)
+# ─────────────────────────────────────────────────────────────
+
 async def submit_hardsub(
     api_key: str,
     video_path: Optional[str] = None,
@@ -212,13 +276,10 @@ async def submit_hardsub(
     scale_height: int = 0,
 ) -> str:
     """
-    High-level: create hardsub job, upload files, return job ID.
-
-    The existing webhook in cloudconvert_hook.py will handle the
-    finished export automatically.
+    High-level: auto-pick best API key, create hardsub job, upload files.
 
     Args:
-        api_key:       CloudConvert API key
+        api_key:       Single key or comma-separated list of keys
         video_path:    Local path to video (for upload mode)
         video_url:     Direct URL to video (CloudConvert fetches it)
         subtitle_path: Local path to .ass / .srt subtitle file
@@ -234,12 +295,20 @@ async def submit_hardsub(
     if not subtitle_path or not os.path.isfile(subtitle_path):
         raise ValueError(f"Subtitle file not found: {subtitle_path}")
 
+    # ── Multi-key rotation ────────────────────────────────────
+    keys = parse_api_keys(api_key)
+    if not keys:
+        raise ValueError("No API keys provided in CC_API_KEY")
+
+    selected_key, credits = await pick_best_key(keys)
+    log.info("[CC-API] Using key with %d credits remaining", credits)
+
+    # ── Create and submit job ─────────────────────────────────
     video_fname = os.path.basename(video_path) if video_path else video_url.split("/")[-1].split("?")[0]
     sub_fname = os.path.basename(subtitle_path)
 
-    # Create the job
     job = await create_hardsub_job(
-        api_key,
+        selected_key,
         video_url=video_url if not video_path else None,
         video_filename=video_fname,
         subtitle_filename=sub_fname,
@@ -271,7 +340,9 @@ async def submit_hardsub(
 
 async def check_job_status(api_key: str, job_id: str) -> dict:
     """Check the status of a CloudConvert job."""
-    headers = {"Authorization": f"Bearer {api_key}"}
+    keys = parse_api_keys(api_key)
+    key = keys[0] if keys else api_key
+    headers = {"Authorization": f"Bearer {key}"}
     async with aiohttp.ClientSession() as sess:
         async with sess.get(f"{CC_API}/jobs/{job_id}", headers=headers) as resp:
             data = await resp.json()
