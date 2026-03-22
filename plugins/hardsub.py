@@ -268,6 +268,7 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
     if ext not in _SUB_EXTS:
         return  # Not a subtitle — let other handlers take it
 
+    # ── From here on we OWN this message — run everything, then stop propagation at the end ──
     tmp = state["tmp"]
     st = await msg.reply("⬇️ Downloading subtitle…")
 
@@ -284,12 +285,9 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    msg.stop_propagation()
-
-    # ── Ready to submit to CloudConvert ───────────────────────
+    # ── Submit to CloudConvert ────────────────────────────────
     video_fname = state.get("video_fname", "video.mkv")
     name_base = os.path.splitext(video_fname)[0]
-    # Clean up for output name
     output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + " [VOSTFR].mp4"
 
     await safe_edit(st,
@@ -315,7 +313,6 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
             output_name=output_name,
         )
 
-        # Determine upload info
         if state.get("video_url"):
             mode_s = "☁️ URL import (no upload needed)"
         else:
@@ -348,3 +345,7 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         )
     finally:
         _clear(uid)
+
+    # stop_propagation MUST be the absolute last line —
+    # it raises StopPropagation which exits the handler immediately
+    msg.stop_propagation()
