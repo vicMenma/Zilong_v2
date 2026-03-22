@@ -67,6 +67,10 @@ class Config:
     cc_webhook_secret: str = field(default_factory=lambda:
         os.environ.get("CC_WEBHOOK_SECRET", ""))
 
+    # CloudConvert API key (for /hardsub command)
+    cc_api_key: str = field(default_factory=lambda:
+        os.environ.get("CC_API_KEY", ""))
+
     @property
     def file_limit_b(self) -> int:
         return self.file_limit_mb * 1024 * 1024
