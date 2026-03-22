@@ -3,20 +3,14 @@ plugins/hardsub.py
 CloudConvert-powered hardsubbing — burn subtitles into video via
 CloudConvert's FFmpeg engine (much faster than Colab's free GPU).
 
-Usage:
-  /hardsub  →  bot asks for video (file or URL) → then subtitle file or URL
-  CloudConvert does the heavy lifting → webhook auto-uploads result
+Flow:
+  /hardsub → video (file/URL/magnet) → subtitle (file/URL/.txt)
+  → pick resolution → CloudConvert processes → webhook auto-uploads
 
 Supports:
-  Video input:
-  - Telegram video file
-  - Direct URL (CloudConvert imports directly — fastest)
-  - Magnet / torrent / yt-dlp / gdrive / mediafire
-
-  Subtitle input:
-  - Telegram file: .ass .srt .vtt .ssa .sub .txt
-  - URL to subtitle: https://example.com/subs/ep01.ass
-  - URL to .txt subtitle file
+  Video:  Telegram file, direct URL, magnet, torrent, yt-dlp, gdrive
+  Subs:   .ass .srt .vtt .ssa .sub .txt — as file or URL
+  Scale:  Original, 1080p, 720p, 480p, 360p
 """
 from __future__ import annotations
 
@@ -24,7 +18,6 @@ import asyncio
 import logging
 import os
 import re
-import time
 import urllib.parse as _urlparse
 
 import aiohttp
@@ -39,10 +32,10 @@ from services.utils import human_size, make_tmp, cleanup, safe_edit
 
 log = logging.getLogger(__name__)
 
-# ── Accepted subtitle extensions ──────────────────────────────
 _SUB_EXTS = {".ass", ".srt", ".vtt", ".ssa", ".sub", ".txt"}
 
 # ── Per-user state machine ────────────────────────────────────
+# Steps: waiting_video → waiting_subtitle → waiting_resolution → done
 _STATE: dict[int, dict] = {}
 
 
@@ -56,22 +49,42 @@ def _clear(uid: int) -> None:
         cleanup(s["tmp"])
 
 
+# ── Resolution picker keyboard ────────────────────────────────
+
+def _res_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Original",  callback_data=f"hs_res|0|{uid}"),
+         InlineKeyboardButton("🔵 1080p",     callback_data=f"hs_res|1080|{uid}")],
+        [InlineKeyboardButton("🟢 720p",      callback_data=f"hs_res|720|{uid}"),
+         InlineKeyboardButton("🟡 480p",      callback_data=f"hs_res|480|{uid}")],
+        [InlineKeyboardButton("🟠 360p",      callback_data=f"hs_res|360|{uid}"),
+         InlineKeyboardButton("❌ Cancel",     callback_data=f"hs_res|cancel|{uid}")],
+    ])
+
+
 # ─────────────────────────────────────────────────────────────
 # Shared: submit hardsub to CloudConvert
 # ─────────────────────────────────────────────────────────────
 
-async def _submit_to_cloudconvert(st, state: dict, sub_fname: str, uid: int) -> None:
-    """Shared submission logic — called after subtitle is ready."""
+async def _submit_to_cloudconvert(
+    st, state: dict, sub_fname: str, uid: int, scale_height: int = 0,
+) -> None:
+    """Shared submission logic — called after resolution is picked."""
     video_fname = state.get("video_fname", "video.mkv")
     name_base = os.path.splitext(video_fname)[0]
-    output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + " [VOSTFR].mp4"
 
+    # Add resolution tag to output name if downscaling
+    res_tag = f" [{scale_height}p VOSTFR]" if scale_height else " [VOSTFR]"
+    output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + f"{res_tag}.mp4"
+
+    res_label = f"{scale_height}p" if scale_height else "Original"
     await safe_edit(st,
         "☁️ <b>Submitting to CloudConvert…</b>\n"
         "──────────────────────\n\n"
-        f"🎬 <code>{video_fname[:45]}</code>\n"
-        f"💬 <code>{sub_fname[:45]}</code>\n"
-        f"📤 → <code>{output_name[:45]}</code>\n\n"
+        f"🎬 <code>{video_fname[:42]}</code>\n"
+        f"💬 <code>{sub_fname[:42]}</code>\n"
+        f"📐 Resolution: <b>{res_label}</b>\n"
+        f"📤 → <code>{output_name[:42]}</code>\n\n"
         "<i>CloudConvert will burn the subtitles and the webhook\n"
         "will auto-upload the result when ready.</i>",
         parse_mode=enums.ParseMode.HTML,
@@ -87,6 +100,7 @@ async def _submit_to_cloudconvert(st, state: dict, sub_fname: str, uid: int) -> 
             video_url=state.get("video_url"),
             subtitle_path=state["sub_path"],
             output_name=output_name,
+            scale_height=scale_height,
         )
 
         if state.get("video_url"):
@@ -99,17 +113,18 @@ async def _submit_to_cloudconvert(st, state: dict, sub_fname: str, uid: int) -> 
             "✅ <b>Hardsub Job Submitted!</b>\n"
             "──────────────────────\n\n"
             f"🆔 <code>{job_id}</code>\n"
-            f"🎬 <code>{video_fname[:40]}</code>\n"
-            f"💬 <code>{sub_fname[:40]}</code>\n"
-            f"📦 → <code>{output_name[:40]}</code>\n"
+            f"🎬 <code>{video_fname[:38]}</code>\n"
+            f"💬 <code>{sub_fname[:38]}</code>\n"
+            f"📐 <b>{res_label}</b>\n"
+            f"📦 → <code>{output_name[:38]}</code>\n"
             f"⚙️ {mode_s}\n\n"
             "⏳ <i>CloudConvert is processing…\n"
             "The webhook will auto-upload the result to this chat.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
 
-        log.info("[Hardsub] Job %s submitted for uid=%d: %s + %s → %s",
-                 job_id, uid, video_fname, sub_fname, output_name)
+        log.info("[Hardsub] Job %s submitted for uid=%d: %s + %s → %s (%s)",
+                 job_id, uid, video_fname, sub_fname, output_name, res_label)
 
     except Exception as exc:
         log.error("[Hardsub] Submit failed: %s", exc, exc_info=True)
@@ -121,6 +136,25 @@ async def _submit_to_cloudconvert(st, state: dict, sub_fname: str, uid: int) -> 
         )
     finally:
         _clear(uid)
+
+
+# ── Show resolution picker ────────────────────────────────────
+
+async def _show_resolution_picker(st, state: dict, sub_fname: str, uid: int) -> None:
+    """Show inline buttons to pick output resolution."""
+    video_fname = state.get("video_fname", "video.mkv")
+    state["step"] = "waiting_resolution"
+    state["_res_msg"] = st  # save reference for callback
+
+    await safe_edit(st,
+        "✅ <b>Subtitle ready!</b>\n"
+        "──────────────────────\n\n"
+        f"🎬 <code>{video_fname[:42]}</code>\n"
+        f"💬 <code>{sub_fname[:42]}</code>\n\n"
+        "📐 <b>Choose output resolution:</b>",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=_res_kb(uid),
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -232,7 +266,7 @@ async def hardsub_video_file(client: Client, msg: Message):
     msg.stop_propagation()
 
 
-# Handle URL/magnet input (for both video step and subtitle step)
+# Handle URL/magnet input (video step + subtitle step)
 @Client.on_message(
     filters.private & filters.text & ~filters.command(
         ["start", "help", "settings", "info", "status", "log", "restart",
@@ -330,7 +364,7 @@ async def hardsub_url_handler(client: Client, msg: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Step 2a: Receive subtitle FILE (.ass .srt .vtt .ssa .sub .txt)
+# Step 2a: Receive subtitle FILE
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_message(
@@ -351,7 +385,7 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
     ext = os.path.splitext(fname)[1].lower()
 
     if ext not in _SUB_EXTS:
-        return  # Not a subtitle — let other handlers take it
+        return
 
     tmp = state["tmp"]
     st = await msg.reply("⬇️ Downloading subtitle…")
@@ -369,31 +403,28 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    # Submit to CloudConvert
-    await _submit_to_cloudconvert(st, state, fname, uid)
+    # Show resolution picker
+    await _show_resolution_picker(st, state, fname, uid)
 
     msg.stop_propagation()
 
 
 # ─────────────────────────────────────────────────────────────
-# Step 2b: Receive subtitle URL (any URL during waiting_subtitle)
+# Step 2b: Receive subtitle URL
 # ─────────────────────────────────────────────────────────────
 
 async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) -> None:
-    """Download subtitle from URL and submit to CloudConvert."""
+    """Download subtitle from URL, then show resolution picker."""
     tmp = state["tmp"]
 
-    # Extract filename from URL
     parsed_path = _urlparse.urlparse(url).path
     raw_fname = os.path.basename(parsed_path)
     fname = _urlparse.unquote_plus(raw_fname) if raw_fname else "subtitle.ass"
 
-    # If no extension or not a sub extension, default to .ass
     ext = os.path.splitext(fname)[1].lower()
     if ext not in _SUB_EXTS:
         fname = fname + ".ass" if fname else "subtitle.ass"
 
-    # Clean filename for filesystem
     fname = re.sub(r'[\\/:*?"<>|]', "_", fname)
 
     st = await msg.reply(
@@ -410,7 +441,6 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
             async with sess.get(url, headers=headers, allow_redirects=True) as resp:
                 resp.raise_for_status()
 
-                # Try to get better filename from Content-Disposition header
                 cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     cd_fname = cd.split("filename=")[-1].strip().strip('"').strip("'")
@@ -423,7 +453,6 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
 
                 content = await resp.read()
 
-        # Sanity check — subtitle files shouldn't be >10MB
         if len(content) > 10_000_000:
             await safe_edit(st, "❌ File too large — doesn't look like a subtitle file.",
                             parse_mode=enums.ParseMode.HTML)
@@ -433,12 +462,11 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
         with open(sub_path, "wb") as f:
             f.write(content)
 
-        fsize = os.path.getsize(sub_path)
         state["sub_path"] = sub_path
         state["sub_fname"] = fname
 
         log.info("[Hardsub] Subtitle downloaded from URL: %s (%s)",
-                 fname, human_size(fsize))
+                 fname, human_size(os.path.getsize(sub_path)))
 
     except Exception as exc:
         log.error("[Hardsub] Subtitle URL download failed: %s", exc)
@@ -449,5 +477,37 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
         _clear(uid)
         return
 
-    # Submit to CloudConvert
-    await _submit_to_cloudconvert(st, state, fname, uid)
+    # Show resolution picker
+    await _show_resolution_picker(st, state, fname, uid)
+
+
+# ─────────────────────────────────────────────────────────────
+# Step 3: Resolution picker callback  hs_res|<height>|<uid>
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^hs_res\|"))
+async def hardsub_resolution_cb(client: Client, cb: CallbackQuery):
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid data.", show_alert=True)
+
+    _, height_str, uid_str = parts[:3]
+    uid = int(uid_str) if uid_str.isdigit() else cb.from_user.id
+
+    state = _user_state(uid)
+    if not state or state["step"] != "waiting_resolution":
+        return await cb.answer("Session expired. Use /hardsub again.", show_alert=True)
+
+    await cb.answer()
+
+    # Cancel
+    if height_str == "cancel":
+        _clear(uid)
+        await cb.message.delete()
+        return
+
+    scale_height = int(height_str) if height_str.isdigit() else 0
+    sub_fname = state.get("sub_fname", "subtitle.ass")
+
+    # Submit to CloudConvert with chosen resolution
+    await _submit_to_cloudconvert(cb.message, state, sub_fname, uid, scale_height)
