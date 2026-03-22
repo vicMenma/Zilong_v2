@@ -1,6 +1,6 @@
 """
 services/cloudconvert_api.py
-CloudConvert API v2 client — hardsubbing with multi-key rotation.
+CloudConvert API v2 client — hardsubbing + conversion with multi-key rotation.
 
 Multi-API key support:
   Set CC_API_KEY to a comma-separated list of keys:
@@ -8,11 +8,9 @@ Multi-API key support:
   The bot checks remaining credits on each key via GET /v2/users/me
   and picks the one with the most minutes available. Exhausted keys are skipped.
 
-Flow:
-  1. Pick best API key (most credits remaining)
-  2. Create a job with: import-video, import-subtitle, command (ffmpeg hardsub), export
-  3. Upload video + subtitle to the import tasks
-  4. Webhook (already in cloudconvert_hook.py) handles the finished export
+Flows:
+  1. submit_hardsub  — burn subtitles into video
+  2. submit_convert  — resolution/format conversion (no subtitles)
 """
 from __future__ import annotations
 
@@ -41,7 +39,6 @@ async def check_credits(api_key: str) -> int:
     """
     Check remaining conversion credits for a single API key.
     Returns credits (minutes) remaining, or -1 on error.
-    GET /v2/users/me → {"data": {"credits": 4434, ...}}
     """
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
@@ -70,10 +67,8 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
                 "CloudConvert: 0 credits remaining on your only API key.\n"
                 "Wait for daily reset or add more keys (comma-separated in CC_API_KEY)."
             )
-        # credits == -1 means check failed — try anyway, CC will reject if truly empty
         return api_keys[0], max(credits, 0)
 
-    # Check all keys concurrently
     tasks = [check_credits(key) for key in api_keys]
     results = await asyncio.gather(*tasks)
 
@@ -102,7 +97,7 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Job creation
+# Job creation — Hardsub
 # ─────────────────────────────────────────────────────────────
 
 async def create_hardsub_job(
@@ -116,22 +111,12 @@ async def create_hardsub_job(
     preset: str = "medium",
     scale_height: int = 0,
 ) -> dict:
-    """
-    Create a CloudConvert job that hardcodes a subtitle into a video.
-
-    Two modes:
-      - video_url set     → CloudConvert fetches the video via import/url
-      - video_url is None → returns an import/upload task (caller must upload)
-
-    Returns the full job response dict including task IDs and upload URLs.
-    """
     v_safe = video_filename.replace("'", "\\'").replace(" ", "_")
     s_safe = subtitle_filename.replace("'", "\\'").replace(" ", "_")
     o_safe = output_filename.replace("'", "\\'").replace(" ", "_")
 
     tasks: dict = {}
 
-    # ── Import video ──────────────────────────────────────────
     if video_url:
         tasks["import-video"] = {
             "operation": "import/url",
@@ -143,16 +128,13 @@ async def create_hardsub_job(
             "operation": "import/upload",
         }
 
-    # ── Import subtitle (always upload) ───────────────────────
     tasks["import-sub"] = {
         "operation": "import/upload",
     }
 
-    # ── FFmpeg hardsub command ────────────────────────────────
     sub_path = f"/input/import-sub/{s_safe}"
     sub_escaped = sub_path.replace("\\", "\\\\").replace(":", "\\:")
 
-    # Build -vf filter chain: optional scale + subtitles
     if scale_height > 0:
         vf = f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
     else:
@@ -175,7 +157,6 @@ async def create_hardsub_job(
         "arguments": ffmpeg_args,
     }
 
-    # ── Export result ─────────────────────────────────────────
     tasks["export"] = {
         "operation": "export/url",
         "input": ["hardsub"],
@@ -200,6 +181,93 @@ async def create_hardsub_job(
 
     job = data.get("data", data)
     log.info("[CC-API] Hardsub job created: id=%s  tasks=%d",
+             job.get("id"), len(job.get("tasks", [])))
+    return job
+
+
+# ─────────────────────────────────────────────────────────────
+# Job creation — Convert (resolution/format, no subtitles)
+# ─────────────────────────────────────────────────────────────
+
+async def create_convert_job(
+    api_key: str,
+    *,
+    video_url: Optional[str] = None,
+    video_filename: str = "video.mkv",
+    output_filename: str = "output.mp4",
+    crf: int = 20,
+    preset: str = "medium",
+    scale_height: int = 0,
+) -> dict:
+    """
+    Create a CloudConvert job that converts video resolution/format.
+    No subtitles — just scale + re-encode to MP4.
+    """
+    v_safe = video_filename.replace("'", "\\'").replace(" ", "_")
+    o_safe = output_filename.replace("'", "\\'").replace(" ", "_")
+
+    tasks: dict = {}
+
+    if video_url:
+        tasks["import-video"] = {
+            "operation": "import/url",
+            "url": video_url,
+            "filename": v_safe,
+        }
+    else:
+        tasks["import-video"] = {
+            "operation": "import/upload",
+        }
+
+    # Build FFmpeg command
+    if scale_height > 0:
+        vf = f"-vf scale=-2:{scale_height}"
+        abr = "128k" if scale_height <= 480 else "192k"
+    else:
+        vf = ""
+        abr = "192k"
+
+    ffmpeg_args = (
+        f"-i /input/import-video/{v_safe} "
+        f"{vf} "
+        f"-c:v libx264 -crf {crf} -preset {preset} "
+        f"-c:a aac -b:a {abr} "
+        f"-movflags +faststart "
+        f"/output/{o_safe}"
+    ).strip()
+
+    tasks["convert"] = {
+        "operation": "command",
+        "input": ["import-video"],
+        "engine": "ffmpeg",
+        "command": "ffmpeg",
+        "arguments": ffmpeg_args,
+    }
+
+    tasks["export"] = {
+        "operation": "export/url",
+        "input": ["convert"],
+    }
+
+    payload = {
+        "tasks": tasks,
+        "tag": "zilong-convert",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(f"{CC_API}/jobs", json=payload, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status not in (200, 201):
+                error = data.get("message", str(data))
+                raise RuntimeError(f"CloudConvert convert job failed ({resp.status}): {error}")
+
+    job = data.get("data", data)
+    log.info("[CC-API] Convert job created: id=%s  tasks=%d",
              job.get("id"), len(job.get("tasks", [])))
     return job
 
@@ -263,7 +331,7 @@ async def upload_file_to_task(
 
 
 # ─────────────────────────────────────────────────────────────
-# High-level submit (with auto key rotation)
+# High-level submit — Hardsub (with auto key rotation)
 # ─────────────────────────────────────────────────────────────
 
 async def submit_hardsub(
@@ -275,27 +343,11 @@ async def submit_hardsub(
     crf: int = 20,
     scale_height: int = 0,
 ) -> str:
-    """
-    High-level: auto-pick best API key, create hardsub job, upload files.
-
-    Args:
-        api_key:       Single key or comma-separated list of keys
-        video_path:    Local path to video (for upload mode)
-        video_url:     Direct URL to video (CloudConvert fetches it)
-        subtitle_path: Local path to .ass / .srt subtitle file
-        output_name:   Desired output filename
-        crf:           FFmpeg CRF quality (lower = better, 18-23 recommended)
-        scale_height:  Target height in pixels (0 = keep original)
-
-    Returns:
-        Job ID string
-    """
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
     if not subtitle_path or not os.path.isfile(subtitle_path):
         raise ValueError(f"Subtitle file not found: {subtitle_path}")
 
-    # ── Multi-key rotation ────────────────────────────────────
     keys = parse_api_keys(api_key)
     if not keys:
         raise ValueError("No API keys provided in CC_API_KEY")
@@ -303,7 +355,6 @@ async def submit_hardsub(
     selected_key, credits = await pick_best_key(keys)
     log.info("[CC-API] Using key with %d credits remaining", credits)
 
-    # ── Create and submit job ─────────────────────────────────
     video_fname = os.path.basename(video_path) if video_path else video_url.split("/")[-1].split("?")[0]
     sub_fname = os.path.basename(subtitle_path)
 
@@ -319,14 +370,12 @@ async def submit_hardsub(
 
     job_id = job.get("id", "?")
 
-    # Upload subtitle (always needed)
     sub_task = _find_task(job, "import-sub")
     if sub_task:
         await upload_file_to_task(sub_task, subtitle_path, sub_fname)
     else:
         raise RuntimeError("No import-sub task found in job")
 
-    # Upload video if local file (not URL import)
     if video_path:
         vid_task = _find_task(job, "import-video")
         if vid_task:
@@ -335,6 +384,66 @@ async def submit_hardsub(
             raise RuntimeError("No import-video task found in job")
 
     log.info("[CC-API] Hardsub job submitted: %s → %s", job_id, output_name)
+    return job_id
+
+
+# ─────────────────────────────────────────────────────────────
+# High-level submit — Convert (with auto key rotation)
+# ─────────────────────────────────────────────────────────────
+
+async def submit_convert(
+    api_key: str,
+    video_path: Optional[str] = None,
+    video_url: Optional[str] = None,
+    output_name: str = "converted.mp4",
+    crf: int = 20,
+    scale_height: int = 0,
+) -> str:
+    """
+    Submit a video conversion job to CloudConvert.
+
+    Args:
+        api_key:       Single key or comma-separated list of keys
+        video_path:    Local path to video (for upload mode)
+        video_url:     Direct URL to video (CloudConvert fetches it)
+        output_name:   Desired output filename
+        crf:           FFmpeg CRF quality (lower = better)
+        scale_height:  Target height in pixels (0 = keep original)
+
+    Returns:
+        Job ID string
+    """
+    if not video_path and not video_url:
+        raise ValueError("Provide either video_path or video_url")
+
+    keys = parse_api_keys(api_key)
+    if not keys:
+        raise ValueError("No API keys provided in CC_API_KEY")
+
+    selected_key, credits = await pick_best_key(keys)
+    log.info("[CC-API] Convert: using key with %d credits remaining", credits)
+
+    video_fname = os.path.basename(video_path) if video_path else video_url.split("/")[-1].split("?")[0]
+
+    job = await create_convert_job(
+        selected_key,
+        video_url=video_url if not video_path else None,
+        video_filename=video_fname,
+        output_filename=output_name,
+        crf=crf,
+        scale_height=scale_height,
+    )
+
+    job_id = job.get("id", "?")
+
+    if video_path:
+        vid_task = _find_task(job, "import-video")
+        if vid_task:
+            await upload_file_to_task(vid_task, video_path, video_fname)
+        else:
+            raise RuntimeError("No import-video task found in job")
+
+    log.info("[CC-API] Convert job submitted: %s → %s", job_id, output_name)
     return job_id
 
 
