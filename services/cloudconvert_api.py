@@ -345,27 +345,44 @@ async def _wait_for_upload_ready(api_key: str, job_id: str, task_name: str) -> d
 # Streaming file uploader with live progress
 # ─────────────────────────────────────────────────────────────
 
-class _TrackingReader:
+import io as _io
+
+
+class _TrackingReader(_io.RawIOBase):
     """
-    Thin wrapper around a binary file that tracks bytes read.
-    aiohttp calls .read(n) on form field payloads, so wrapping the file
-    object here gives a synchronous progress hook at zero overhead.
+    io.RawIOBase subclass that tracks how many bytes have been read.
+    Inheriting from RawIOBase makes aiohttp recognise it as a valid
+    file-like object for FormData — plain objects with .read() are
+    rejected with "Can not serialize value type: <filename>".
     """
     def __init__(self, path: str) -> None:
+        super().__init__()
         self._f         = open(path, "rb")
         self.total      = os.path.getsize(path)
         self.bytes_read = 0
+
+    def readinto(self, b: bytearray) -> int:
+        """Required by RawIOBase — aiohttp calls read() which delegates here."""
+        data = self._f.read(len(b))
+        n    = len(data)
+        b[:n] = data
+        self.bytes_read += n
+        return n
 
     def read(self, n: int = -1) -> bytes:
         chunk = self._f.read(n)
         self.bytes_read += len(chunk)
         return chunk
 
+    def readable(self) -> bool:
+        return True
+
     def __len__(self) -> int:
         return self.total
 
     def close(self) -> None:
         self._f.close()
+        super().close()
 
 
 async def upload_file_to_task(
