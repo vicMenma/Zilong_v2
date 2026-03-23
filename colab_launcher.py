@@ -87,6 +87,7 @@ if not GITHUB_TOKEN: GITHUB_TOKEN = _secret("GITHUB_TOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
 
+errors = []
 if not API_ID:        errors.append("API_ID is required")
 if not API_HASH:      errors.append("API_HASH is required")
 if not BOT_TOKEN:     errors.append("BOT_TOKEN is required")
