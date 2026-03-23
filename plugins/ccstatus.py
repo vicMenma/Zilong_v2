@@ -343,55 +343,171 @@ async def _sweep(client: Client, api_key: str) -> None:
 
 
 async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
+    """
+    Called once when a job reaches finished or error state.
+
+    On success: extract the export URL from the CC response and
+    download + upload the file directly — no webhook needed.
+    This is the primary delivery path and works on Colab, AWS,
+    and Koyeb regardless of whether ngrok/webhook is configured.
+
+    On error: send a clear failure message with the error detail.
+    """
     try:
         if status == "finished":
+            # ── Find export URL ───────────────────────────────
+            export_url  = None
             output_name = job.output_name
+
             for task in data.get("tasks", []):
                 if task.get("operation") == "export/url" and task.get("status") == "finished":
                     files = (task.get("result") or {}).get("files", [])
                     if files:
+                        export_url  = files[0].get("url")
                         output_name = files[0].get("filename", output_name)
                     break
 
             duration = ""
             if job.finished_at:
                 secs     = int(job.finished_at - job.submitted_at)
-                duration = f"  ·  done in {secs // 60}m {secs % 60}s"
+                duration = f"{secs // 60}m {secs % 60}s"
 
-            text = (
-                "☁️ <b>CloudConvert — Job Finished!</b>\n"
-                "──────────────────────\n\n"
-                f"🎬 <code>{job.fname[:45]}</code>\n"
-                f"💬 <code>{job.sub_fname[:35]}</code>\n"
-                f"📁 <code>{output_name[:45]}</code>\n"
-                f"🆔 <code>{job.job_id}</code>{duration}\n\n"
-                "⬆️ <i>The webhook is uploading the result to this chat…</i>\n\n"
-                "<i>Use /ccstatus to check all jobs.</i>"
-            )
+            if export_url:
+                # ── Download from CC and upload to Telegram ───
+                log.info(
+                    "[CCStatus] Downloading finished job %s → %s",
+                    job.job_id, output_name,
+                )
+                notify_msg = await client.send_message(
+                    job.uid,
+                    f"☁️ <b>CloudConvert — Finished!</b>  ({duration})
+"
+                    f"──────────────────────
+
+"
+                    f"🎬 <code>{job.fname[:45]}</code>
+"
+                    f"📁 <code>{output_name[:45]}</code>
+
+"
+                    f"⬇️ <i>Downloading result and uploading to Telegram…</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                try:
+                    from core.config import cfg
+                    from services.utils import make_tmp, cleanup, largest_file
+                    from services.uploader import upload_file
+
+                    tmp  = make_tmp(cfg.download_dir, job.uid)
+                    path = await _download_export(export_url, output_name, tmp, job.uid)
+
+                    if path and os.path.isfile(path):
+                        await upload_file(client, notify_msg, path)
+                        cleanup(tmp)
+                    else:
+                        await notify_msg.edit(
+                            f"☁️ <b>CloudConvert — Finished!</b>
+
+"
+                            f"🎬 <code>{job.fname[:45]}</code>
+"
+                            f"📁 <code>{output_name[:45]}</code>
+
+"
+                            f"⚠️ <i>Auto-download failed — "
+                            f"<a href='{export_url}'>download manually</a></i>",
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        cleanup(tmp)
+                except Exception as dl_exc:
+                    log.error("[CCStatus] Download/upload pipeline failed: %s", dl_exc)
+                    try:
+                        await notify_msg.edit(
+                            f"☁️ <b>CloudConvert — Finished!</b>
+
+"
+                            f"🎬 <code>{job.fname[:45]}</code>
+"
+                            f"📁 <code>{output_name[:45]}</code>
+
+"
+                            f"⚠️ <i>Auto-upload failed: {str(dl_exc)[:80]}
+"
+                            f"<a href='{export_url}'>Download manually</a></i>",
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # No export URL found — fallback text only
+                await client.send_message(
+                    job.uid,
+                    f"☁️ <b>CloudConvert — Finished!</b>  ({duration})
+
+"
+                    f"🎬 <code>{job.fname[:45]}</code>
+"
+                    f"⚠️ <i>No export URL found — check the CC dashboard.</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
 
         else:
+            # ── Error ─────────────────────────────────────────
             err = job.error_msg or "Unknown error"
-            text = (
-                "☁️ <b>CloudConvert — Job Failed</b>\n"
-                "──────────────────────\n\n"
-                f"🎬 <code>{job.fname[:45]}</code>\n"
-                f"🆔 <code>{job.job_id}</code>\n\n"
-                f"❌ <code>{err}</code>\n\n"
-                "<i>Use /ccstatus to see all jobs.\n"
-                "You can resubmit with /hardsub.</i>"
-            )
+            await client.send_message(
+                job.uid,
+                f"☁️ <b>CloudConvert — Job Failed</b>
+"
+                f"──────────────────────
 
-        await client.send_message(
-            job.uid, text,
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📋 View All Jobs",
-                    callback_data=f"ccs|refresh|{job.uid}",
-                )]
-            ]),
-        )
+"
+                f"🎬 <code>{job.fname[:45]}</code>
+"
+                f"🆔 <code>{job.job_id}</code>
+
+"
+                f"❌ <code>{err}</code>
+
+"
+                f"<i>Use /ccstatus to see all jobs.
+"
+                f"Resubmit with /hardsub.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
 
     except Exception as exc:
         log.warning("[CCStatus] Could not notify uid=%d job %s: %s",
                     job.uid, job.job_id, exc)
+
+
+async def _download_export(url: str, filename: str, tmp: str, uid: int) -> Optional[str]:
+    """
+    Download a CloudConvert export URL to tmp dir.
+    Uses aiohttp directly — no aria2c dependency, works on all platforms.
+    Streams in 8MB chunks to keep memory flat even for 1.5GB files.
+    """
+    import re as _re
+    safe  = _re.sub(r'[\/:*?"<>|]', "_", filename) or "output.mp4"
+    dest  = os.path.join(tmp, safe)
+    CHUNK = 8 * 1024 * 1024  # 8 MB
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    timeout = aiohttp.ClientTimeout(total=7200)   # 2h max
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, headers=headers,
+                            allow_redirects=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                async for chunk in resp.content.iter_chunked(CHUNK):
+                    f.write(chunk)
+
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        log.info(
+            "[CCStatus] Export downloaded: %s  (%.1f MB)",
+            safe, os.path.getsize(dest) / (1024 * 1024),
+        )
+        return dest
+    return None
