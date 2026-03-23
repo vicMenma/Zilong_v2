@@ -34,6 +34,10 @@ _POLL_IDLE = 60   # seconds — used when all jobs are waiting/finished
 
 _poller_started = False
 
+# Tracks the last active /ccstatus panel message per user uid → Message
+# The poller edits these automatically whenever status changes.
+_open_panels: dict[int, object] = {}
+
 
 # ─────────────────────────────────────────────────────────────
 # Formatting helpers
@@ -172,9 +176,10 @@ def _status_kb(uid: int) -> InlineKeyboardMarkup:
 async def cmd_ccstatus(client: Client, msg: Message):
     uid = msg.from_user.id
     await _ensure_poller(client)
-    text = _render_panel(uid)
-    await msg.reply(text, parse_mode=enums.ParseMode.HTML,
-                    reply_markup=_status_kb(uid))
+    text    = _render_panel(uid)
+    sent    = await msg.reply(text, parse_mode=enums.ParseMode.HTML,
+                              reply_markup=_status_kb(uid))
+    _open_panels[uid] = sent
 
 
 # ─────────────────────────────────────────────────────────────
@@ -192,6 +197,7 @@ async def ccs_cb(client: Client, cb: CallbackQuery):
     await cb.answer()
 
     if action == "close":
+        _open_panels.pop(uid, None)
         return await cb.message.delete()
 
     if action == "clear":
@@ -208,6 +214,7 @@ async def ccs_cb(client: Client, cb: CallbackQuery):
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=_status_kb(uid),
             )
+            _open_panels[uid] = cb.message   # keep panel reference fresh
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" not in str(e):
                 raise
@@ -308,10 +315,28 @@ async def _sweep(client: Client, api_key: str) -> None:
                     updates.get("task_message", job.task_message),
                 )
 
+            # ── Push update to open panel message ────────────
+            if updates:
+                panel_msg = _open_panels.get(job.uid)
+                if panel_msg:
+                    try:
+                        from pyrogram import enums as _enums
+                        fresh_text = _render_panel(job.uid)
+                        await panel_msg.edit(
+                            fresh_text,
+                            parse_mode=_enums.ParseMode.HTML,
+                            reply_markup=_status_kb(job.uid),
+                        )
+                    except Exception as _pe:
+                        if "MESSAGE_NOT_MODIFIED" not in str(_pe):
+                            log.debug("[CCStatus] Panel edit failed: %s", _pe)
+
             # ── Notify user on terminal status ────────────────
             if status in ("finished", "error") and not job.notified:
                 await _notify(client, job, status, data)
                 await job_store.update(job.job_id, notified=True)
+                # Clear panel ref so final state is always re-fetched
+                _open_panels.pop(job.uid, None)
 
         except Exception as exc:
             log.warning("[CCStatus] Failed to check job %s: %s", job.job_id, exc)
