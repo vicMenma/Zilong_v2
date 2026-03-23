@@ -3,11 +3,12 @@ plugins/ccstatus.py
 /ccstatus — CloudConvert job status dashboard with live FFmpeg progress.
 
 Features:
-  - Shows all submitted hardsub/convert jobs with live status
   - Live FFmpeg encoding progress bar (polled every 5s while processing)
-  - Background poller: 5s when any job is encoding, 60s when idle
-  - Auto-notifies you the moment a job finishes or errors
-  - Inline ♻️ Refresh and 🗑 Clear Finished buttons
+  - Auto-delivers finished files directly from CC export URL (no webhook needed)
+  - Open /ccstatus panel auto-edits in place as status changes
+  - Background poller: 5s when encoding, 60s when idle
+  - Auto-notifies on finish or error
+  - Inline Refresh and Clear Finished buttons
   - Jobs persist across restarts via data/cc_jobs.json
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import os
 import time
 from typing import Optional
 
+import aiohttp
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -28,13 +30,12 @@ from services.utils import safe_edit
 
 log = logging.getLogger(__name__)
 
-# ── Poller intervals ──────────────────────────────────────────
-_POLL_FAST = 5    # seconds — used when ≥1 job is actively encoding
-_POLL_IDLE = 60   # seconds — used when all jobs are waiting/finished
+_POLL_FAST = 5    # seconds — while any job is actively encoding
+_POLL_IDLE = 60   # seconds — when all jobs are waiting/finished/done
 
 _poller_started = False
 
-# Tracks the last active /ccstatus panel message per user uid → Message
+# Tracks the last active /ccstatus panel message per user: uid → Message
 # The poller edits these automatically whenever status changes.
 _open_panels: dict[int, object] = {}
 
@@ -72,41 +73,34 @@ def _age(ts: float) -> str:
 def _render_job(j: CCJob, idx: int) -> str:
     icon  = _STATUS_ICON.get(j.status, "❓")
     label = _STATUS_LABEL.get(j.status, j.status.upper())
-
     lines = [
         f"<b>[{idx}]</b>  {icon} <b>{label}</b>",
         f"  🎬 <code>{j.fname[:45]}</code>",
         f"  💬 <code>{j.sub_fname[:35]}</code>",
         f"  🆔 <code>{j.job_id}</code>",
     ]
-
     if j.status == "processing":
-        pct = j.progress_pct
-        bar = _prog_bar(pct)
-        msg = j.task_message or "Executing ffmpeg"
+        pct     = j.progress_pct
+        bar     = _prog_bar(pct)
+        msg     = j.task_message or "Executing ffmpeg"
         elapsed = int(time.time() - j.submitted_at)
         lines += [
             f"  📊 <code>[{bar}]</code>  <b>{pct:.1f}%</b>",
             f"  ⚙️ <i>{msg}</i>",
             f"  ⏱ {elapsed // 60}m {elapsed % 60}s elapsed",
         ]
-
     elif j.status == "waiting":
-        elapsed = int(time.time() - j.submitted_at)
         lines.append(f"  ⏳ Submitted {_age(j.submitted_at)} — waiting to start")
-
     elif j.status == "finished" and j.finished_at:
-        duration = int(j.finished_at - j.submitted_at)
+        secs = int(j.finished_at - j.submitted_at)
         lines += [
-            f"  ✅ Done in <b>{duration // 60}m {duration % 60}s</b>",
+            f"  ✅ Done in <b>{secs // 60}m {secs % 60}s</b>",
             f"  📁 <code>{j.output_name[:45]}</code>",
         ]
-
     elif j.status == "error":
         lines.append(f"  ⏱ {_age(j.submitted_at)}")
         if j.error_msg:
             lines.append(f"  ⚠️ <code>{j.error_msg[:80]}</code>")
-
     return "\n".join(lines)
 
 
@@ -142,20 +136,13 @@ def _render_panel(uid: int) -> str:
     if len(jobs) > 10:
         lines.append(f"\n<i>…and {len(jobs) - 10} more. Use 🗑 Clear Finished to clean up.</i>")
 
-    # Show polling rate hint only when actively encoding
     encoding = [j for j in jobs if j.status == "processing"]
+    lines.append("")
+    lines.append("──────────────────────")
     if encoding:
-        lines += [
-            "",
-            "──────────────────────",
-            f"<i>🔁 Polling every {_POLL_FAST}s — auto-notified on completion</i>",
-        ]
+        lines.append(f"<i>🔁 Polling every {_POLL_FAST}s — auto-notified on completion</i>")
     else:
-        lines += [
-            "",
-            "──────────────────────",
-            "<i>Tap ♻️ Refresh to update · auto-notified on completion</i>",
-        ]
+        lines.append("<i>Tap ♻️ Refresh to update · auto-notified on completion</i>")
 
     return "\n".join(lines)
 
@@ -174,11 +161,11 @@ def _status_kb(uid: int) -> InlineKeyboardMarkup:
 
 @Client.on_message(filters.private & filters.command("ccstatus"))
 async def cmd_ccstatus(client: Client, msg: Message):
-    uid = msg.from_user.id
+    uid  = msg.from_user.id
     await _ensure_poller(client)
-    text    = _render_panel(uid)
-    sent    = await msg.reply(text, parse_mode=enums.ParseMode.HTML,
-                              reply_markup=_status_kb(uid))
+    text = _render_panel(uid)
+    sent = await msg.reply(text, parse_mode=enums.ParseMode.HTML,
+                           reply_markup=_status_kb(uid))
     _open_panels[uid] = sent
 
 
@@ -209,12 +196,9 @@ async def ccs_cb(client: Client, cb: CallbackQuery):
         await _ensure_poller(client)
         text = _render_panel(uid)
         try:
-            await cb.message.edit(
-                text,
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=_status_kb(uid),
-            )
-            _open_panels[uid] = cb.message   # keep panel reference fresh
+            await cb.message.edit(text, parse_mode=enums.ParseMode.HTML,
+                                  reply_markup=_status_kb(uid))
+            _open_panels[uid] = cb.message
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" not in str(e):
                 raise
@@ -245,21 +229,12 @@ async def _poll_loop(client: Client) -> None:
         except Exception as exc:
             log.warning("[CCStatus] Sweep error: %s", exc)
 
-        # Use fast interval when any job is actively encoding
-        active = job_store.all_active()
+        active   = job_store.all_active()
         encoding = any(j.status == "processing" for j in active)
-        interval = _POLL_FAST if encoding else _POLL_IDLE
-        await asyncio.sleep(interval)
+        await asyncio.sleep(_POLL_FAST if encoding else _POLL_IDLE)
 
 
 async def _sweep(client: Client, api_key: str) -> None:
-    """
-    Check all active jobs once.
-
-    For each job:
-      - Extract percent + message from the active task → update progress bar
-      - If status changed to finished/error → notify user
-    """
     from services.cloudconvert_api import check_job_status
 
     active = job_store.all_active()
@@ -270,35 +245,26 @@ async def _sweep(client: Client, api_key: str) -> None:
 
     for job in active:
         try:
-            data   = await check_job_status(api_key, job.job_id)
-            status = data.get("status", job.status)
-
-            # ── Extract encoding progress from tasks ──────────
+            data    = await check_job_status(api_key, job.job_id)
+            status  = data.get("status", job.status)
             updates: dict = {}
-            processing_task = None
 
+            # ── Extract FFmpeg encoding progress ──────────────
             for task in data.get("tasks", []):
-                t_status = task.get("status", "")
-                t_op     = task.get("operation", "")
-
-                # Find the task that is currently encoding
-                if t_status == "processing" and t_op == "command":
-                    processing_task = task
+                if task.get("status") == "processing" and task.get("operation") == "command":
                     pct = float(task.get("percent") or 0)
                     msg = task.get("message", "") or "Executing ffmpeg"
-                    updates["progress_pct"]  = pct
-                    updates["task_message"]  = msg
-                    updates["progress_at"]   = time.time()
+                    updates["progress_pct"] = pct
+                    updates["task_message"] = msg
+                    updates["progress_at"]  = time.time()
                     break
 
-            # ── Status change handling ────────────────────────
+            # ── Status change ─────────────────────────────────
             if status != job.status:
                 updates["status"] = status
-
                 if status in ("finished", "error"):
-                    updates["finished_at"]   = time.time()
-                    updates["progress_pct"]  = 100.0 if status == "finished" else job.progress_pct
-
+                    updates["finished_at"]  = time.time()
+                    updates["progress_pct"] = 100.0 if status == "finished" else job.progress_pct
                 if status == "error":
                     for task in data.get("tasks", []):
                         if task.get("status") == "error":
@@ -309,53 +275,43 @@ async def _sweep(client: Client, api_key: str) -> None:
             if updates:
                 await job_store.update(job.job_id, **updates)
                 log.info(
-                    "[CCStatus] Job %s  status=%s  pct=%.1f%%  msg=%s",
-                    job.job_id, updates.get("status", job.status),
+                    "[CCStatus] Job %s  status=%s  pct=%.1f%%",
+                    job.job_id,
+                    updates.get("status", job.status),
                     updates.get("progress_pct", job.progress_pct),
-                    updates.get("task_message", job.task_message),
                 )
 
-            # ── Push update to open panel message ────────────
-            if updates:
+                # Push update to open panel message
                 panel_msg = _open_panels.get(job.uid)
                 if panel_msg:
                     try:
-                        from pyrogram import enums as _enums
                         fresh_text = _render_panel(job.uid)
                         await panel_msg.edit(
                             fresh_text,
-                            parse_mode=_enums.ParseMode.HTML,
+                            parse_mode=enums.ParseMode.HTML,
                             reply_markup=_status_kb(job.uid),
                         )
-                    except Exception as _pe:
-                        if "MESSAGE_NOT_MODIFIED" not in str(_pe):
-                            log.debug("[CCStatus] Panel edit failed: %s", _pe)
+                    except Exception as pe:
+                        if "MESSAGE_NOT_MODIFIED" not in str(pe):
+                            log.debug("[CCStatus] Panel edit failed: %s", pe)
 
-            # ── Notify user on terminal status ────────────────
+            # ── Notify + deliver on terminal status ───────────
             if status in ("finished", "error") and not job.notified:
                 await _notify(client, job, status, data)
                 await job_store.update(job.job_id, notified=True)
-                # Clear panel ref so final state is always re-fetched
                 _open_panels.pop(job.uid, None)
 
         except Exception as exc:
             log.warning("[CCStatus] Failed to check job %s: %s", job.job_id, exc)
 
 
+# ─────────────────────────────────────────────────────────────
+# Delivery — download from CC and upload to Telegram
+# ─────────────────────────────────────────────────────────────
+
 async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
-    """
-    Called once when a job reaches finished or error state.
-
-    On success: extract the export URL from the CC response and
-    download + upload the file directly — no webhook needed.
-    This is the primary delivery path and works on Colab, AWS,
-    and Koyeb regardless of whether ngrok/webhook is configured.
-
-    On error: send a clear failure message with the error detail.
-    """
     try:
         if status == "finished":
-            # ── Find export URL ───────────────────────────────
             export_url  = None
             output_name = job.output_name
 
@@ -367,35 +323,25 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
                         output_name = files[0].get("filename", output_name)
                     break
 
-            duration = ""
-            if job.finished_at:
-                secs     = int(job.finished_at - job.submitted_at)
-                duration = f"{secs // 60}m {secs % 60}s"
+            secs     = int(job.finished_at - job.submitted_at) if job.finished_at else 0
+            duration = f"{secs // 60}m {secs % 60}s"
 
             if export_url:
-                # ── Download from CC and upload to Telegram ───
-                log.info(
-                    "[CCStatus] Downloading finished job %s → %s",
-                    job.job_id, output_name,
-                )
                 notify_msg = await client.send_message(
                     job.uid,
-                    f"☁️ <b>CloudConvert — Finished!</b>  ({duration})
-"
-                    f"──────────────────────
-
-"
-                    f"🎬 <code>{job.fname[:45]}</code>
-"
-                    f"📁 <code>{output_name[:45]}</code>
-
-"
-                    f"⬇️ <i>Downloading result and uploading to Telegram…</i>",
+                    (
+                        "☁️ <b>CloudConvert — Finished!</b>  "
+                        f"({duration})\n"
+                        "──────────────────────\n\n"
+                        f"🎬 <code>{job.fname[:45]}</code>\n"
+                        f"📁 <code>{output_name[:45]}</code>\n\n"
+                        "⬇️ <i>Downloading result and uploading to Telegram…</i>"
+                    ),
                     parse_mode=enums.ParseMode.HTML,
                 )
                 try:
                     from core.config import cfg
-                    from services.utils import make_tmp, cleanup, largest_file
+                    from services.utils import make_tmp, cleanup
                     from services.uploader import upload_file
 
                     tmp  = make_tmp(cfg.download_dir, job.uid)
@@ -406,74 +352,59 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
                         cleanup(tmp)
                     else:
                         await notify_msg.edit(
-                            f"☁️ <b>CloudConvert — Finished!</b>
-
-"
-                            f"🎬 <code>{job.fname[:45]}</code>
-"
-                            f"📁 <code>{output_name[:45]}</code>
-
-"
-                            f"⚠️ <i>Auto-download failed — "
-                            f"<a href='{export_url}'>download manually</a></i>",
+                            (
+                                "☁️ <b>CloudConvert — Finished!</b>\n\n"
+                                f"🎬 <code>{job.fname[:45]}</code>\n"
+                                f"📁 <code>{output_name[:45]}</code>\n\n"
+                                "⚠️ <i>Auto-download failed — "
+                                f"<a href='{export_url}'>download manually</a></i>"
+                            ),
                             parse_mode=enums.ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
                         cleanup(tmp)
+
                 except Exception as dl_exc:
-                    log.error("[CCStatus] Download/upload pipeline failed: %s", dl_exc)
+                    log.error("[CCStatus] Delivery pipeline failed: %s", dl_exc)
                     try:
                         await notify_msg.edit(
-                            f"☁️ <b>CloudConvert — Finished!</b>
-
-"
-                            f"🎬 <code>{job.fname[:45]}</code>
-"
-                            f"📁 <code>{output_name[:45]}</code>
-
-"
-                            f"⚠️ <i>Auto-upload failed: {str(dl_exc)[:80]}
-"
-                            f"<a href='{export_url}'>Download manually</a></i>",
+                            (
+                                "☁️ <b>CloudConvert — Finished!</b>\n\n"
+                                f"🎬 <code>{job.fname[:45]}</code>\n"
+                                f"📁 <code>{output_name[:45]}</code>\n\n"
+                                f"⚠️ <i>Auto-upload failed: {str(dl_exc)[:80]}\n"
+                                f"<a href='{export_url}'>Download manually</a></i>"
+                            ),
                             parse_mode=enums.ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
                     except Exception:
                         pass
             else:
-                # No export URL found — fallback text only
                 await client.send_message(
                     job.uid,
-                    f"☁️ <b>CloudConvert — Finished!</b>  ({duration})
-
-"
-                    f"🎬 <code>{job.fname[:45]}</code>
-"
-                    f"⚠️ <i>No export URL found — check the CC dashboard.</i>",
+                    (
+                        "☁️ <b>CloudConvert — Finished!</b>  "
+                        f"({duration})\n\n"
+                        f"🎬 <code>{job.fname[:45]}</code>\n"
+                        "⚠️ <i>No export URL found — check the CC dashboard.</i>"
+                    ),
                     parse_mode=enums.ParseMode.HTML,
                 )
 
         else:
-            # ── Error ─────────────────────────────────────────
             err = job.error_msg or "Unknown error"
             await client.send_message(
                 job.uid,
-                f"☁️ <b>CloudConvert — Job Failed</b>
-"
-                f"──────────────────────
-
-"
-                f"🎬 <code>{job.fname[:45]}</code>
-"
-                f"🆔 <code>{job.job_id}</code>
-
-"
-                f"❌ <code>{err}</code>
-
-"
-                f"<i>Use /ccstatus to see all jobs.
-"
-                f"Resubmit with /hardsub.</i>",
+                (
+                    "☁️ <b>CloudConvert — Job Failed</b>\n"
+                    "──────────────────────\n\n"
+                    f"🎬 <code>{job.fname[:45]}</code>\n"
+                    f"🆔 <code>{job.job_id}</code>\n\n"
+                    f"❌ <code>{err}</code>\n\n"
+                    "<i>Use /ccstatus to see all jobs.\n"
+                    "Resubmit with /hardsub.</i>"
+                ),
                 parse_mode=enums.ParseMode.HTML,
             )
 
@@ -484,17 +415,17 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
 
 async def _download_export(url: str, filename: str, tmp: str, uid: int) -> Optional[str]:
     """
-    Download a CloudConvert export URL to tmp dir.
-    Uses aiohttp directly — no aria2c dependency, works on all platforms.
-    Streams in 8MB chunks to keep memory flat even for 1.5GB files.
+    Download a CloudConvert export URL to tmp dir using pure aiohttp.
+    Streams in 8MB chunks — works on Colab, AWS, and Koyeb with no
+    external dependencies. No webhook required.
     """
     import re as _re
-    safe  = _re.sub(r'[\/:*?"<>|]', "_", filename) or "output.mp4"
+    safe  = _re.sub(r'[\\/:*?"<>|]', "_", filename) or "output.mp4"
     dest  = os.path.join(tmp, safe)
-    CHUNK = 8 * 1024 * 1024  # 8 MB
+    CHUNK = 8 * 1024 * 1024
 
     headers = {"User-Agent": "Mozilla/5.0"}
-    timeout = aiohttp.ClientTimeout(total=7200)   # 2h max
+    timeout = aiohttp.ClientTimeout(total=7200)
 
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, headers=headers,
@@ -505,9 +436,7 @@ async def _download_export(url: str, filename: str, tmp: str, uid: int) -> Optio
                     f.write(chunk)
 
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        log.info(
-            "[CCStatus] Export downloaded: %s  (%.1f MB)",
-            safe, os.path.getsize(dest) / (1024 * 1024),
-        )
+        log.info("[CCStatus] Export downloaded: %s (%.1f MB)",
+                 safe, os.path.getsize(dest) / (1024 * 1024))
         return dest
     return None
