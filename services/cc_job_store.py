@@ -3,7 +3,8 @@ services/cc_job_store.py
 Persistent registry of submitted CloudConvert jobs.
 
 Stores to data/cc_jobs.json so jobs survive bot restarts.
-Each entry tracks: job_id, uid, filenames, status, timing, notification flag.
+Each entry tracks: job_id, uid, filenames, status, progress,
+timing, and notification flag.
 """
 from __future__ import annotations
 
@@ -22,22 +23,26 @@ _STORE_FILE = os.path.normpath(
 )
 os.makedirs(os.path.dirname(_STORE_FILE), exist_ok=True)
 
-# How long to keep finished/errored jobs visible before auto-eviction
-JOB_LINGER_SECS = 3600 * 6  # 6 hours
+# Keep finished/errored jobs visible for 6 hours then auto-evict
+JOB_LINGER_SECS = 3600 * 6
 
 
 @dataclass
 class CCJob:
     job_id:       str
     uid:          int
-    fname:        str           # video filename shown to user
+    fname:        str           # video filename
     sub_fname:    str           # subtitle filename
     output_name:  str           # expected output filename
     submitted_at: float = field(default_factory=time.time)
     status:       str   = "processing"  # waiting|processing|finished|error
     error_msg:    str   = ""
     finished_at:  Optional[float] = None
-    notified:     bool  = False  # True once user was sent a completion message
+    notified:     bool  = False
+    # ── Live encoding progress ────────────────────────────────
+    progress_pct:   float = 0.0    # 0-100, from CC task.percent
+    task_message:   str   = ""     # e.g. "Executing ffmpeg"
+    progress_at:    float = 0.0    # timestamp of last progress update
 
 
 class CCJobStore:
@@ -53,10 +58,13 @@ class CCJobStore:
             with open(_STORE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             for entry in data:
-                # Guard against missing keys from older schema
-                entry.setdefault("notified", False)
-                entry.setdefault("error_msg", "")
-                entry.setdefault("finished_at", None)
+                # Backfill keys added after initial schema
+                entry.setdefault("notified",      False)
+                entry.setdefault("error_msg",     "")
+                entry.setdefault("finished_at",   None)
+                entry.setdefault("progress_pct",  0.0)
+                entry.setdefault("task_message",  "")
+                entry.setdefault("progress_at",   0.0)
                 j = CCJob(**entry)
                 self._jobs[j.job_id] = j
             log.info("[CCStore] Loaded %d job(s) from disk", len(self._jobs))
@@ -68,16 +76,14 @@ class CCJobStore:
     def _save(self) -> None:
         try:
             os.makedirs(os.path.dirname(_STORE_FILE), exist_ok=True)
-            entries = [asdict(j) for j in self._jobs.values()]
             with open(_STORE_FILE, "w", encoding="utf-8") as f:
-                json.dump(entries, f, indent=2)
+                json.dump([asdict(j) for j in self._jobs.values()], f, indent=2)
         except Exception as exc:
             log.warning("[CCStore] Save error: %s", exc)
 
     # ── Eviction ──────────────────────────────────────────────
 
     def _evict(self) -> None:
-        """Remove old terminal jobs silently."""
         now  = time.time()
         dead = [
             jid for jid, j in self._jobs.items()
@@ -112,7 +118,6 @@ class CCJobStore:
             self._save()
 
     async def clear_finished(self, uid: int) -> int:
-        """Remove all finished/errored jobs for a user. Returns count removed."""
         async with self._lock:
             before = len(self._jobs)
             self._jobs = {
@@ -138,7 +143,6 @@ class CCJobStore:
         )
 
     def all_active(self) -> list[CCJob]:
-        """Jobs still in waiting or processing state — used by the poller."""
         return [
             j for j in self._jobs.values()
             if j.status in ("waiting", "processing")
