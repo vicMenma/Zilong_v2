@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Optional
 
 import aiohttp
@@ -31,13 +32,17 @@ log = logging.getLogger(__name__)
 CC_API = "https://api.cloudconvert.com/v2"
 
 # How long to wait for an import/upload task to reach "waiting" state
-# before giving up and raising an error.
-_UPLOAD_READY_TIMEOUT = 30   # seconds
-_UPLOAD_READY_POLL    = 1.5  # seconds between polls
+_UPLOAD_READY_TIMEOUT = 30    # seconds
+_UPLOAD_READY_POLL    = 1.5   # seconds between polls
+
+# Minimum upload timeout regardless of file size
+_UPLOAD_TIMEOUT_MIN = 120          # seconds
+# Extra seconds per MB — assumes ~1.9 MB/s minimum Colab uplink
+_UPLOAD_TIMEOUT_PER_MB = 8        # seconds / MB
 
 
 # ─────────────────────────────────────────────────────────────
-# Multi-key credit checking & rotation
+# Filename sanitiser
 # ─────────────────────────────────────────────────────────────
 
 def parse_api_keys(raw: str) -> list[str]:
@@ -52,25 +57,26 @@ def _safe_fname(name: str) -> str:
       - spaces        → underscore
       - parentheses   → removed  (breaks shell argument splitting)
       - single quotes → removed  (breaks vf filter quoting)
-      - brackets      → removed
-      - colons        → removed  (breaks Windows paths / FFmpeg option syntax)
-      - everything else non-word except dot and dash → underscore
+      - brackets, colons, and other shell specials → removed
+
+    The sanitised name is used both in the FFmpeg command AND as the
+    filename sent to S3 so they always match exactly.
     """
     import re as _re
-    # Replace spaces with underscores first
     name = name.replace(" ", "_")
-    # Remove characters that break shell/FFmpeg parsing
-    name = _re.sub(r"[()\[\]'":;|&<>!@#$%^*+=`~]", "", name)
-    # Collapse multiple underscores/dashes
+    name = _re.sub(r"[()[\]'\":;|&<>!@#$%^*+=`~]", "", name)
     name = _re.sub(r"[_\-]{2,}", "_", name)
     return name.strip("_-") or "file"
 
 
+# ─────────────────────────────────────────────────────────────
+# Multi-key credit checking & rotation
+# ─────────────────────────────────────────────────────────────
+
 async def check_credits(api_key: str) -> int:
     """
     Check remaining conversion credits for a single API key.
-    Returns credits (minutes) remaining, or -1 on error.
-    Also warns loudly if the key is a Sandbox key.
+    Returns credits remaining, or -1 on error.
     """
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
@@ -80,18 +86,14 @@ async def check_credits(api_key: str) -> int:
                     log.warning("[CC-API] Credit check failed: HTTP %d", resp.status)
                     return -1
                 data = await resp.json()
-                user = data.get("data", {})
+                user    = data.get("data", {})
                 credits = user.get("credits", 0)
-
-                # Detect sandbox keys — they have no credits and their username
-                # often contains "sandbox", or the response includes a sandbox flag
                 if user.get("sandbox"):
                     log.error(
-                        "[CC-API] ⚠️  SANDBOX KEY DETECTED — "
+                        "[CC-API] SANDBOX KEY DETECTED — "
                         "jobs will ERROR instantly. Use a Live API key."
                     )
                     return 0
-
                 return int(credits)
     except Exception as exc:
         log.warning("[CC-API] Credit check error: %s", exc)
@@ -99,46 +101,39 @@ async def check_credits(api_key: str) -> int:
 
 
 async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
-    """
-    Check credits on all keys concurrently, return the one with most credits.
-    Returns (best_key, credits). Raises RuntimeError if all keys exhausted.
-    """
+    """Return the key with the most credits. Raises if all exhausted."""
     if len(api_keys) == 1:
         credits = await check_credits(api_keys[0])
         if credits == 0:
             raise RuntimeError(
-                "CloudConvert: 0 credits remaining on your only API key.\n"
+                "CloudConvert: 0 credits remaining.\n"
                 "Wait for daily reset or add more keys (comma-separated in CC_API_KEY).\n"
                 "Also make sure you are using a LIVE key, not a Sandbox key."
             )
         return api_keys[0], max(credits, 0)
 
-    tasks = [check_credits(key) for key in api_keys]
-    results = await asyncio.gather(*tasks)
-
+    results  = await asyncio.gather(*[check_credits(k) for k in api_keys])
     best_key = ""
-    best_credits = -1
-    status_lines = []
+    best_crd = -1
+    lines    = []
 
-    for key, credits in zip(api_keys, results):
-        short = key[-8:]
-        status_lines.append(f"  ...{short}: {credits} credits")
-        if credits > best_credits:
-            best_credits = credits
+    for key, crd in zip(api_keys, results):
+        lines.append(f"  ...{key[-8:]}: {crd} credits")
+        if crd > best_crd:
+            best_crd = crd
             best_key = key
 
-    log.info("[CC-API] Key rotation — %d keys checked:\n%s",
-             len(api_keys), "\n".join(status_lines))
+    log.info("[CC-API] Key rotation — %d keys:\n%s", len(api_keys), "\n".join(lines))
 
-    if best_credits <= 0:
+    if best_crd <= 0:
         raise RuntimeError(
             f"CloudConvert: all {len(api_keys)} API keys exhausted (0 credits).\n"
             "Wait for daily reset or add more keys.\n"
-            "Also make sure you are using LIVE keys, not Sandbox keys."
+            "Make sure you are using LIVE keys, not Sandbox keys."
         )
 
-    log.info("[CC-API] Selected key ...%s (%d credits remaining)", best_key[-8:], best_credits)
-    return best_key, best_credits
+    log.info("[CC-API] Selected key ...%s (%d credits)", best_key[-8:], best_crd)
+    return best_key, best_crd
 
 
 # ─────────────────────────────────────────────────────────────
@@ -148,43 +143,39 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
 async def create_hardsub_job(
     api_key: str,
     *,
-    video_url: Optional[str] = None,
-    video_filename: str = "video.mkv",
+    video_url:         Optional[str] = None,
+    video_filename:    str = "video.mkv",
     subtitle_filename: str = "subtitle.ass",
-    output_filename: str = "output.mp4",
-    crf: int = 20,
-    preset: str = "medium",
+    output_filename:   str = "output.mp4",
+    crf:          int = 20,
+    preset:       str = "medium",
     scale_height: int = 0,
 ) -> dict:
     v_safe = _safe_fname(video_filename)
     s_safe = _safe_fname(subtitle_filename)
     o_safe = _safe_fname(output_filename)
 
-    tasks: dict = {}
+    job_tasks: dict = {}
 
     if video_url:
-        tasks["import-video"] = {
+        job_tasks["import-video"] = {
             "operation": "import/url",
-            "url": video_url,
-            "filename": v_safe,
+            "url":       video_url,
+            "filename":  v_safe,
         }
     else:
-        tasks["import-video"] = {
-            "operation": "import/upload",
-        }
+        job_tasks["import-video"] = {"operation": "import/upload"}
 
-    tasks["import-sub"] = {
-        "operation": "import/upload",
-    }
+    job_tasks["import-sub"] = {"operation": "import/upload"}
 
     sub_path = f"/input/import-sub/{s_safe}"
-    # CloudConvert passes -vf to FFmpeg via shell — single quotes inside
-    # the filter string break argument splitting. _safe_fname already
-    # removed all shell-unsafe characters so no quoting is needed.
+    # No quotes around the subtitle path — _safe_fname removed all shell-unsafe
+    # characters so the bare path is safe and avoids shell quoting conflicts.
     if scale_height > 0:
         vf = f"scale=-2:{scale_height},subtitles={sub_path}"
     else:
         vf = f"subtitles={sub_path}"
+
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
         f"-vf {vf} "
@@ -194,126 +185,104 @@ async def create_hardsub_job(
         f"/output/{o_safe}"
     )
 
-    tasks["hardsub"] = {
+    job_tasks["hardsub"] = {
         "operation": "command",
-        "input": ["import-video", "import-sub"],
-        "engine": "ffmpeg",
-        "command": "ffmpeg",
+        "input":     ["import-video", "import-sub"],
+        "engine":    "ffmpeg",
+        "command":   "ffmpeg",
         "arguments": ffmpeg_args,
     }
+    job_tasks["export"] = {"operation": "export/url", "input": ["hardsub"]}
 
-    tasks["export"] = {
-        "operation": "export/url",
-        "input": ["hardsub"],
-    }
-
-    payload = {
-        "tasks": tasks,
-        "tag": "zilong-hardsub",
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as sess:
-        async with sess.post(f"{CC_API}/jobs", json=payload, headers=headers) as resp:
+        async with sess.post(
+            f"{CC_API}/jobs",
+            json={"tasks": job_tasks, "tag": "zilong-hardsub"},
+            headers=headers,
+        ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
-                error = data.get("message", str(data))
-                raise RuntimeError(f"CloudConvert job creation failed ({resp.status}): {error}")
+                raise RuntimeError(
+                    f"CloudConvert job creation failed ({resp.status}): "
+                    f"{data.get('message', str(data))}"
+                )
 
     job = data.get("data", data)
-    log.info("[CC-API] Hardsub job created: id=%s  tasks=%d",
-             job.get("id"), len(job.get("tasks", [])))
+    log.info("[CC-API] Hardsub job created: id=%s", job.get("id"))
     return job
 
 
 # ─────────────────────────────────────────────────────────────
-# Job creation — Convert (resolution/format, no subtitles)
+# Job creation — Convert (no subtitles)
 # ─────────────────────────────────────────────────────────────
 
 async def create_convert_job(
     api_key: str,
     *,
-    video_url: Optional[str] = None,
-    video_filename: str = "video.mkv",
+    video_url:       Optional[str] = None,
+    video_filename:  str = "video.mkv",
     output_filename: str = "output.mp4",
-    crf: int = 20,
-    preset: str = "medium",
+    crf:          int = 20,
+    preset:       str = "medium",
     scale_height: int = 0,
 ) -> dict:
     v_safe = _safe_fname(video_filename)
     o_safe = _safe_fname(output_filename)
 
-    tasks: dict = {}
+    job_tasks: dict = {}
 
     if video_url:
-        tasks["import-video"] = {
+        job_tasks["import-video"] = {
             "operation": "import/url",
-            "url": video_url,
-            "filename": v_safe,
+            "url":       video_url,
+            "filename":  v_safe,
         }
     else:
-        tasks["import-video"] = {
-            "operation": "import/upload",
-        }
+        job_tasks["import-video"] = {"operation": "import/upload"}
 
-    if scale_height > 0:
-        vf  = f"-vf scale=-2:{scale_height}"
-        abr = "128k" if scale_height <= 480 else "192k"
-    else:
-        vf  = ""
-        abr = "192k"
+    vf_flag = f"-vf scale=-2:{scale_height} " if scale_height > 0 else ""
+    abr     = "128k" if scale_height > 0 and scale_height <= 480 else "192k"
 
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
-        f"{vf} "
+        f"{vf_flag}"
         f"-c:v libx264 -crf {crf} -preset {preset} "
         f"-c:a aac -b:a {abr} "
         f"-movflags +faststart "
         f"/output/{o_safe}"
     ).strip()
 
-    tasks["convert"] = {
+    job_tasks["convert"] = {
         "operation": "command",
-        "input": ["import-video"],
-        "engine": "ffmpeg",
-        "command": "ffmpeg",
+        "input":     ["import-video"],
+        "engine":    "ffmpeg",
+        "command":   "ffmpeg",
         "arguments": ffmpeg_args,
     }
+    job_tasks["export"] = {"operation": "export/url", "input": ["convert"]}
 
-    tasks["export"] = {
-        "operation": "export/url",
-        "input": ["convert"],
-    }
-
-    payload = {
-        "tasks": tasks,
-        "tag": "zilong-convert",
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as sess:
-        async with sess.post(f"{CC_API}/jobs", json=payload, headers=headers) as resp:
+        async with sess.post(
+            f"{CC_API}/jobs",
+            json={"tasks": job_tasks, "tag": "zilong-convert"},
+            headers=headers,
+        ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
-                error = data.get("message", str(data))
-                raise RuntimeError(f"CloudConvert convert job failed ({resp.status}): {error}")
+                raise RuntimeError(
+                    f"CloudConvert convert job failed ({resp.status}): "
+                    f"{data.get('message', str(data))}"
+                )
 
     job = data.get("data", data)
-    log.info("[CC-API] Convert job created: id=%s  tasks=%d",
-             job.get("id"), len(job.get("tasks", [])))
+    log.info("[CC-API] Convert job created: id=%s", job.get("id"))
     return job
 
 
 # ─────────────────────────────────────────────────────────────
-# Upload helpers
+# Upload task readiness poller
 # ─────────────────────────────────────────────────────────────
 
 def _find_task(job: dict, name: str) -> Optional[dict]:
@@ -323,26 +292,16 @@ def _find_task(job: dict, name: str) -> Optional[dict]:
     return None
 
 
-async def _wait_for_upload_ready(
-    api_key: str,
-    job_id: str,
-    task_name: str,
-) -> dict:
+async def _wait_for_upload_ready(api_key: str, job_id: str, task_name: str) -> dict:
     """
-    Poll the CC API until the named import/upload task reaches 'waiting'
-    status with a valid form URL. This is necessary because CC needs a
-    moment after job creation to prepare S3 upload credentials.
-
-    Without this wait, the bot tries to upload before the URL exists,
-    causing an instant ERROR on the job.
-
-    Returns the ready task dict.
-    Raises RuntimeError if timeout is exceeded.
+    Poll until the named import/upload task is in 'waiting' state with
+    a valid S3 form URL. CC needs ~1-4s after job creation to prepare
+    upload credentials — uploading before this causes instant ERROR.
     """
     headers  = {"Authorization": f"Bearer {api_key}"}
     deadline = asyncio.get_event_loop().time() + _UPLOAD_READY_TIMEOUT
 
-    log.info("[CC-API] Waiting for task '%s' to be ready for upload…", task_name)
+    log.info("[CC-API] Waiting for task '%s' upload URL…", task_name)
 
     while asyncio.get_event_loop().time() < deadline:
         async with aiohttp.ClientSession() as sess:
@@ -354,53 +313,76 @@ async def _wait_for_upload_ready(
 
         job = data.get("data", data)
 
-        # Check if entire job errored before we even start uploading
         if job.get("status") == "error":
-            # Find the errored task for a useful message
-            for task in job.get("tasks", []):
-                if task.get("status") == "error":
-                    msg = task.get("message", "Unknown error")
+            for t in job.get("tasks", []):
+                if t.get("status") == "error":
                     raise RuntimeError(
-                        f"CloudConvert job errored before upload: {msg}\n"
+                        f"CC job errored before upload: {t.get('message', 'Unknown')}\n"
                         "Make sure you are using a LIVE API key, not a Sandbox key."
                     )
-            raise RuntimeError("CloudConvert job errored before upload could start.")
+            raise RuntimeError("CC job errored before upload could start.")
 
-        task = _find_task(job, task_name)
-        if not task:
-            await asyncio.sleep(_UPLOAD_READY_POLL)
-            continue
+        task   = _find_task(job, task_name)
+        status = (task or {}).get("status", "")
+        url    = (((task or {}).get("result") or {}).get("form") or {}).get("url")
 
-        status = task.get("status", "")
-        result = task.get("result") or {}
-        form   = result.get("form") or {}
-        url    = form.get("url")
-
-        if status == "waiting" and url:
-            log.info("[CC-API] Task '%s' ready — upload URL obtained", task_name)
+        if task and status == "waiting" and url:
+            log.info("[CC-API] Task '%s' ready for upload", task_name)
             return task
+        if task and status == "error":
+            raise RuntimeError(
+                f"CC task '{task_name}' errored: {task.get('message', 'Unknown')}"
+            )
 
-        if status == "error":
-            msg = task.get("message", "Unknown error")
-            raise RuntimeError(f"CloudConvert task '{task_name}' errored: {msg}")
-
-        log.debug("[CC-API] Task '%s' status=%s — polling again…", task_name, status)
         await asyncio.sleep(_UPLOAD_READY_POLL)
 
     raise RuntimeError(
-        f"CloudConvert task '{task_name}' did not become ready within "
-        f"{_UPLOAD_READY_TIMEOUT}s. The API may be slow — try again."
+        f"CC task '{task_name}' not ready within {_UPLOAD_READY_TIMEOUT}s — try again."
     )
 
 
+# ─────────────────────────────────────────────────────────────
+# Streaming file uploader with live progress
+# ─────────────────────────────────────────────────────────────
+
+class _TrackingReader:
+    """
+    Thin wrapper around a binary file that tracks bytes read.
+    aiohttp calls .read(n) on form field payloads, so wrapping the file
+    object here gives a synchronous progress hook at zero overhead.
+    """
+    def __init__(self, path: str) -> None:
+        self._f         = open(path, "rb")
+        self.total      = os.path.getsize(path)
+        self.bytes_read = 0
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._f.read(n)
+        self.bytes_read += len(chunk)
+        return chunk
+
+    def __len__(self) -> int:
+        return self.total
+
+    def close(self) -> None:
+        self._f.close()
+
+
 async def upload_file_to_task(
-    task: dict,
+    task:      dict,
     file_path: str,
-    filename: Optional[str] = None,
+    filename:  Optional[str] = None,
+    user_id:   int = 0,
+    label:     str = "",
 ) -> None:
     """
-    Upload a local file to a CloudConvert import/upload task.
-    The task must already be in 'waiting' status (use _wait_for_upload_ready first).
+    Stream a local file to a CloudConvert import/upload task with:
+      - Streaming body    — never loads the whole file into memory
+      - Live progress     — updates the bot's unified progress panel every second
+      - Dynamic timeout   — scales with file size, never times out on large files
+      - Auto-retry        — up to 3 attempts on transient network errors
+
+    The task must already be in 'waiting' status (call _wait_for_upload_ready first).
     """
     result = task.get("result") or {}
     form   = result.get("form") or {}
@@ -409,45 +391,160 @@ async def upload_file_to_task(
 
     if not url:
         raise RuntimeError(
-            "No upload URL in task — task is not in 'waiting' state. "
-            "Call _wait_for_upload_ready() before this function."
+            "No upload URL in task — not in 'waiting' state. "
+            "Call _wait_for_upload_ready() first."
         )
 
     raw_fname = filename or os.path.basename(file_path)
-    fname     = _safe_fname(raw_fname)  # ensure uploaded name matches what FFmpeg references
+    fname     = _safe_fname(raw_fname)
     fsize     = os.path.getsize(file_path)
-    log.info("[CC-API] Uploading %s → %s (%d bytes) to %s…", raw_fname, fname, fsize, url[:60])
+    fsize_mb  = fsize / (1024 * 1024)
 
-    data = aiohttp.FormData()
-    for key, value in params.items():
-        data.add_field(key, str(value))
-    data.add_field(
-        "file",
-        open(file_path, "rb"),
-        filename=fname,
+    # Timeout scales with file size: min 2 min, +8s/MB, cap 2h
+    timeout_secs = min(
+        max(_UPLOAD_TIMEOUT_MIN, int(fsize_mb * _UPLOAD_TIMEOUT_PER_MB)),
+        7200,
     )
 
-    async with aiohttp.ClientSession() as sess:
-        async with sess.post(url, data=data, allow_redirects=True) as resp:
-            if resp.status not in (200, 201, 204, 301, 302):
-                body = await resp.text()
-                raise RuntimeError(f"Upload failed ({resp.status}): {body[:300]}")
+    log.info(
+        "[CC-API] Uploading %s → %s  (%.1f MB, timeout=%ds)",
+        raw_fname, fname, fsize_mb, timeout_secs,
+    )
 
-    log.info("[CC-API] Upload complete: %s", fname)
+    # ── Register with task tracker so progress panel shows the upload ────
+    record = None
+    if user_id:
+        try:
+            from services.task_runner import tracker, TaskRecord
+            tid    = tracker.new_tid()
+            record = TaskRecord(
+                tid=tid, user_id=user_id,
+                label=label or "Upload to CloudConvert",
+                mode="ul", engine="direct",
+                fname=fname, total=fsize,
+                state="📤 Uploading to CloudConvert…",
+            )
+            await tracker.register(record)
+        except Exception as _te:
+            log.debug("[CC-API] Tracker unavailable: %s", _te)
+
+    start = time.time()
+
+    async def _poll_progress(reader: _TrackingReader) -> None:
+        """Background task — samples reader.bytes_read every 1s and pushes to panel."""
+        if record is None:
+            return
+        try:
+            from services.task_runner import runner
+            while True:
+                await asyncio.sleep(1.0)
+                done    = reader.bytes_read
+                elapsed = time.time() - start
+                speed   = done / elapsed if elapsed else 0.0
+                eta     = int((fsize - done) / speed) if speed and done < fsize else 0
+                record.update(
+                    done=done, total=fsize,
+                    speed=speed, eta=eta, elapsed=elapsed,
+                    state="📤 Uploading to CloudConvert…",
+                )
+                runner._wake_panel(user_id)
+                if done >= fsize:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    # ── Upload with retry ─────────────────────────────────────────────────
+    MAX_ATTEMPTS = 3
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        reader        = _TrackingReader(file_path)
+        progress_task: Optional[asyncio.Task] = None
+
+        try:
+            progress_task = asyncio.create_task(_poll_progress(reader))
+
+            # S3 presigned POST: policy fields must come BEFORE the file field
+            form_data = aiohttp.FormData()
+            for key, value in params.items():
+                form_data.add_field(key, str(value))
+            form_data.add_field(
+                "file",
+                reader,                           # aiohttp reads via .read() calls
+                filename=fname,
+                content_type="application/octet-stream",
+            )
+
+            timeout = aiohttp.ClientTimeout(total=timeout_secs)
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    url, data=form_data,
+                    allow_redirects=True,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status not in (200, 201, 204, 301, 302):
+                        body = await resp.text()
+                        raise RuntimeError(
+                            f"S3 upload rejected ({resp.status}): {body[:300]}"
+                        )
+
+            # ── Success ───────────────────────────────────────
+            elapsed = time.time() - start
+            speed   = fsize_mb / elapsed if elapsed else 0
+            log.info(
+                "[CC-API] Upload complete: %s  %.1f MB in %.1fs  (%.1f MB/s)",
+                fname, fsize_mb, elapsed, speed,
+            )
+            if record is not None:
+                record.update(done=fsize, total=fsize, state="✅ Done", elapsed=elapsed)
+                try:
+                    from services.task_runner import runner
+                    runner._wake_panel(user_id, immediate=True)
+                except Exception:
+                    pass
+            return  # success — exit retry loop
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            last_exc = exc
+            log.warning(
+                "[CC-API] Upload attempt %d/%d failed for %s: %s",
+                attempt, MAX_ATTEMPTS, fname, exc,
+            )
+            if attempt < MAX_ATTEMPTS:
+                wait = 5 * attempt
+                log.info("[CC-API] Retrying in %ds…", wait)
+                await asyncio.sleep(wait)
+
+        finally:
+            reader.close()
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+    # All attempts failed
+    if record is not None:
+        record.update(state=f"❌ Upload failed after {MAX_ATTEMPTS} attempts")
+    raise RuntimeError(
+        f"CloudConvert upload failed after {MAX_ATTEMPTS} attempts: {last_exc}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-# High-level submit — Hardsub (with auto key rotation)
+# High-level submit — Hardsub
 # ─────────────────────────────────────────────────────────────
 
 async def submit_hardsub(
-    api_key: str,
-    video_path: Optional[str] = None,
-    video_url: Optional[str] = None,
+    api_key:       str,
+    video_path:    Optional[str] = None,
+    video_url:     Optional[str] = None,
     subtitle_path: str = "",
-    output_name: str = "hardsub.mp4",
-    crf: int = 20,
-    scale_height: int = 0,
+    output_name:   str = "hardsub.mp4",
+    crf:           int = 20,
+    scale_height:  int = 0,
+    user_id:       int = 0,
 ) -> str:
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
@@ -477,31 +574,39 @@ async def submit_hardsub(
 
     job_id = job.get("id", "?")
 
-    # ── Upload subtitle ───────────────────────────────────────
-    # Always poll until ready — CC needs time to prepare S3 credentials
+    # ── Upload subtitle (small, always fast) ──────────────────
     sub_task = await _wait_for_upload_ready(selected_key, job_id, "import-sub")
-    await upload_file_to_task(sub_task, subtitle_path, sub_fname)
+    await upload_file_to_task(
+        sub_task, subtitle_path, sub_fname,
+        user_id=user_id,
+        label=f"Sub → CC: {_safe_fname(sub_fname)}",
+    )
 
-    # ── Upload video (only when sending a file, not a URL) ────
+    # ── Upload video file (only when not using a URL) ─────────
     if video_path:
         vid_task = await _wait_for_upload_ready(selected_key, job_id, "import-video")
-        await upload_file_to_task(vid_task, video_path, video_fname)
+        await upload_file_to_task(
+            vid_task, video_path, video_fname,
+            user_id=user_id,
+            label=f"Video → CC: {_safe_fname(video_fname)}",
+        )
 
     log.info("[CC-API] Hardsub job fully submitted: %s → %s", job_id, output_name)
     return job_id
 
 
 # ─────────────────────────────────────────────────────────────
-# High-level submit — Convert (with auto key rotation)
+# High-level submit — Convert
 # ─────────────────────────────────────────────────────────────
 
 async def submit_convert(
-    api_key: str,
-    video_path: Optional[str] = None,
-    video_url: Optional[str] = None,
-    output_name: str = "converted.mp4",
-    crf: int = 20,
+    api_key:      str,
+    video_path:   Optional[str] = None,
+    video_url:    Optional[str] = None,
+    output_name:  str = "converted.mp4",
+    crf:          int = 20,
     scale_height: int = 0,
+    user_id:      int = 0,
 ) -> str:
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
@@ -527,10 +632,13 @@ async def submit_convert(
 
     job_id = job.get("id", "?")
 
-    # ── Upload video (only when sending a file, not a URL) ────
     if video_path:
         vid_task = await _wait_for_upload_ready(selected_key, job_id, "import-video")
-        await upload_file_to_task(vid_task, video_path, video_fname)
+        await upload_file_to_task(
+            vid_task, video_path, video_fname,
+            user_id=user_id,
+            label=f"Video → CC: {_safe_fname(video_fname)}",
+        )
 
     log.info("[CC-API] Convert job fully submitted: %s → %s", job_id, output_name)
     return job_id
@@ -542,8 +650,8 @@ async def submit_convert(
 
 async def check_job_status(api_key: str, job_id: str) -> dict:
     """Check the status of a CloudConvert job."""
-    keys = parse_api_keys(api_key)
-    key  = keys[0] if keys else api_key
+    keys    = parse_api_keys(api_key)
+    key     = keys[0] if keys else api_key
     headers = {"Authorization": f"Bearer {key}"}
     async with aiohttp.ClientSession() as sess:
         async with sess.get(f"{CC_API}/jobs/{job_id}", headers=headers) as resp:
