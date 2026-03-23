@@ -22,8 +22,10 @@ CC_API_KEY        = ""  # @param {type:"string"}
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
-REPO_URL = "https://github.com/vicMenma/Zilong_v2.git"
-BASE_DIR = "/content/zilong"
+GITHUB_TOKEN = ""   # @param {type:"string"}  ← paste PAT here, or use 🔑 secret
+REPO_OWNER   = "vicMenma"
+REPO_NAME    = "Zilong_v2"
+BASE_DIR     = "/content/zilong"
 
 
 def _log(level: str, msg: str):
@@ -81,15 +83,15 @@ if not LOG_CHANNEL or str(LOG_CHANNEL).strip() in ("", "0"):
 else:
     LOG_CHANNEL = _resolve_channel(LOG_CHANNEL)
 
-if not NGROK_TOKEN:       NGROK_TOKEN       = _secret("NGROK_TOKEN")
+if not GITHUB_TOKEN: GITHUB_TOKEN = _secret("GITHUB_TOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
 
-errors = []
-if not API_ID:    errors.append("API_ID is required")
-if not API_HASH:  errors.append("API_HASH is required")
-if not BOT_TOKEN: errors.append("BOT_TOKEN is required")
-if not OWNER_ID:  errors.append("OWNER_ID is required")
+if not API_ID:        errors.append("API_ID is required")
+if not API_HASH:      errors.append("API_HASH is required")
+if not BOT_TOKEN:     errors.append("BOT_TOKEN is required")
+if not OWNER_ID:      errors.append("OWNER_ID is required")
+if not GITHUB_TOKEN:  errors.append("GITHUB_TOKEN is required (repo is private)")
 if errors:
     print()
     for e in errors: print(f"  ❌ {e}")
@@ -114,11 +116,14 @@ _log("OK", "System packages ready")
 _log("STEP", "Cloning repository…")
 if os.path.exists(BASE_DIR):
     shutil.rmtree(BASE_DIR)
+REPO_URL = f"https://{GITHUB_TOKEN}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
 r = subprocess.run(["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
                    capture_output=True, text=True)
 if r.returncode != 0:
-    raise SystemExit(f"❌ Clone failed:\n{r.stderr[:300]}")
-_log("OK", f"Cloned to {BASE_DIR}")
+    # Mask token in error output so it doesn't leak into logs
+    err_clean = r.stderr.replace(GITHUB_TOKEN, "***")
+    raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
+_log("OK", f"Cloned {REPO_OWNER}/{REPO_NAME} to {BASE_DIR}")
 
 _log("STEP", "Installing Python packages…")
 # Remove stock pyrogram before installing pyrofork — both expose the same
@@ -310,12 +315,42 @@ restart_count = 0
 
 while restart_count < MAX_RESTARTS:
     t_start = datetime.now()
+    # Inject ALL resolved vars directly into the subprocess environment.
+    # This bypasses python-dotenv's default override=False behaviour, which
+    # silently keeps stale empty values from a previous Colab session and
+    # causes secrets like NGROK_TOKEN to appear missing even when set.
+    _injected_env = {
+        **os.environ,
+        "PYTHONUNBUFFERED":     "1",
+        "API_ID":               str(API_ID),
+        "API_HASH":             API_HASH,
+        "BOT_TOKEN":            BOT_TOKEN,
+        "OWNER_ID":             str(OWNER_ID),
+        "FILE_LIMIT_MB":        str(FILE_LIMIT_MB),
+        "LOG_CHANNEL":          LOG_CHANNEL,
+        "NGROK_TOKEN":          NGROK_TOKEN,
+        "CC_WEBHOOK_SECRET":    CC_WEBHOOK_SECRET,
+        "CC_API_KEY":           CC_API_KEY,
+        "DOWNLOAD_DIR":         "/tmp/zilong_dl",
+        "ARIA2_HOST":           "http://localhost",
+        "ARIA2_PORT":           "6800",
+        "ARIA2_SECRET":         "",
+        "UPLOAD_CONCURRENCY":   "1",
+        "BOT_WORKERS":          "16",
+        "UPLOAD_PARTS_PARALLEL":"16",
+    }
+    # Optional secrets — only inject if non-empty
+    for _opt in ("ADMINS", "GDRIVE_SA_JSON"):
+        _v = _secret(_opt)
+        if _v:
+            _injected_env[_opt] = _v
+
     proc = subprocess.Popen(
         [sys.executable, "-u", "main.py"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, bufsize=1,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env=_injected_env,
     )
     for line in proc.stdout:
         print(line, end="", flush=True)
