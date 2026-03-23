@@ -1,12 +1,13 @@
 """
 plugins/ccstatus.py
-/ccstatus — CloudConvert job status dashboard.
+/ccstatus — CloudConvert job status dashboard with live FFmpeg progress.
 
 Features:
-  - Shows all your submitted hardsub/convert jobs with live status
+  - Shows all submitted hardsub/convert jobs with live status
+  - Live FFmpeg encoding progress bar (polled every 5s while processing)
+  - Background poller: 5s when any job is encoding, 60s when idle
+  - Auto-notifies you the moment a job finishes or errors
   - Inline ♻️ Refresh and 🗑 Clear Finished buttons
-  - Background poller runs every 60s, notifies you the moment a job
-    finishes or errors (no need to manually check)
   - Jobs persist across restarts via data/cc_jobs.json
 """
 from __future__ import annotations
@@ -27,8 +28,10 @@ from services.utils import safe_edit
 
 log = logging.getLogger(__name__)
 
-# ── Poller state ──────────────────────────────────────────────
-_POLL_INTERVAL  = 60   # seconds between full sweeps
+# ── Poller intervals ──────────────────────────────────────────
+_POLL_FAST = 5    # seconds — used when ≥1 job is actively encoding
+_POLL_IDLE = 60   # seconds — used when all jobs are waiting/finished
+
 _poller_started = False
 
 
@@ -44,51 +47,62 @@ _STATUS_ICON = {
 }
 _STATUS_LABEL = {
     "waiting":    "Queued",
-    "processing": "Processing",
+    "processing": "Encoding",
     "finished":   "Finished",
     "error":      "Failed",
 }
 
 
+def _prog_bar(pct: float, cells: int = 12) -> str:
+    filled = round(pct / 100 * cells)
+    return "█" * filled + "░" * (cells - filled)
+
+
 def _age(ts: float) -> str:
-    """Human-readable time since ts."""
     s = int(time.time() - ts)
     if s < 60:   return f"{s}s ago"
-    if s < 3600: return f"{s//60}m ago"
-    return f"{s//3600}h {(s%3600)//60}m ago"
-
-
-def _eta_guess(job: CCJob) -> str:
-    """Rough ETA based on elapsed time — CC typically takes 2-5 min/episode."""
-    elapsed = time.time() - job.submitted_at
-    # Average encode time ~3 min; if we're past 10 min something is off
-    remaining = max(0, 180 - elapsed)
-    if elapsed > 600:
-        return "⚠️ taking longer than usual"
-    if remaining < 10:
-        return "finishing soon…"
-    return f"~{int(remaining//60)}m remaining (est.)"
+    if s < 3600: return f"{s // 60}m ago"
+    return f"{s // 3600}h {(s % 3600) // 60}m ago"
 
 
 def _render_job(j: CCJob, idx: int) -> str:
     icon  = _STATUS_ICON.get(j.status, "❓")
     label = _STATUS_LABEL.get(j.status, j.status.upper())
+
     lines = [
         f"<b>[{idx}]</b>  {icon} <b>{label}</b>",
         f"  🎬 <code>{j.fname[:45]}</code>",
         f"  💬 <code>{j.sub_fname[:35]}</code>",
         f"  🆔 <code>{j.job_id}</code>",
     ]
-    if j.status in ("waiting", "processing"):
-        lines.append(f"  ⏱ Submitted {_age(j.submitted_at)}  —  {_eta_guess(j)}")
+
+    if j.status == "processing":
+        pct = j.progress_pct
+        bar = _prog_bar(pct)
+        msg = j.task_message or "Executing ffmpeg"
+        elapsed = int(time.time() - j.submitted_at)
+        lines += [
+            f"  📊 <code>[{bar}]</code>  <b>{pct:.1f}%</b>",
+            f"  ⚙️ <i>{msg}</i>",
+            f"  ⏱ {elapsed // 60}m {elapsed % 60}s elapsed",
+        ]
+
+    elif j.status == "waiting":
+        elapsed = int(time.time() - j.submitted_at)
+        lines.append(f"  ⏳ Submitted {_age(j.submitted_at)} — waiting to start")
+
     elif j.status == "finished" and j.finished_at:
         duration = int(j.finished_at - j.submitted_at)
-        lines.append(f"  ✅ Done in {duration//60}m {duration%60}s")
-        lines.append(f"  📁 <code>{j.output_name[:45]}</code>")
+        lines += [
+            f"  ✅ Done in <b>{duration // 60}m {duration % 60}s</b>",
+            f"  📁 <code>{j.output_name[:45]}</code>",
+        ]
+
     elif j.status == "error":
-        lines.append(f"  ⏱ Submitted {_age(j.submitted_at)}")
+        lines.append(f"  ⏱ {_age(j.submitted_at)}")
         if j.error_msg:
-            lines.append(f"  💬 {j.error_msg[:80]}")
+            lines.append(f"  ⚠️ <code>{j.error_msg[:80]}</code>")
+
     return "\n".join(lines)
 
 
@@ -113,27 +127,40 @@ def _render_panel(uid: int) -> str:
 
     lines = [
         "☁️ <b>CloudConvert Status</b>",
-        f"<code>{'  ·  '.join(summary)}</code>",
+        f"<code>{'  ·  '.join(summary) if summary else 'idle'}</code>",
         "──────────────────────",
     ]
 
-    for i, j in enumerate(jobs[:10], 1):   # cap at 10 to avoid message too long
+    for i, j in enumerate(jobs[:10], 1):
         lines.append("")
         lines.append(_render_job(j, i))
 
     if len(jobs) > 10:
-        lines.append(f"\n<i>…and {len(jobs)-10} more. Use 🗑 Clear Finished to clean up.</i>")
+        lines.append(f"\n<i>…and {len(jobs) - 10} more. Use 🗑 Clear Finished to clean up.</i>")
 
-    lines += ["", "──────────────────────",
-              "<i>Tap ♻️ Refresh to update · auto-notified on completion</i>"]
+    # Show polling rate hint only when actively encoding
+    encoding = [j for j in jobs if j.status == "processing"]
+    if encoding:
+        lines += [
+            "",
+            "──────────────────────",
+            f"<i>🔁 Polling every {_POLL_FAST}s — auto-notified on completion</i>",
+        ]
+    else:
+        lines += [
+            "",
+            "──────────────────────",
+            "<i>Tap ♻️ Refresh to update · auto-notified on completion</i>",
+        ]
+
     return "\n".join(lines)
 
 
 def _status_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("♻️ Refresh",         callback_data=f"ccs|refresh|{uid}"),
-         InlineKeyboardButton("🗑 Clear Finished",  callback_data=f"ccs|clear|{uid}")],
-        [InlineKeyboardButton("❌ Close",            callback_data=f"ccs|close|{uid}")],
+        [InlineKeyboardButton("♻️ Refresh",        callback_data=f"ccs|refresh|{uid}"),
+         InlineKeyboardButton("🗑 Clear Finished", callback_data=f"ccs|clear|{uid}")],
+        [InlineKeyboardButton("❌ Close",           callback_data=f"ccs|close|{uid}")],
     ])
 
 
@@ -171,14 +198,16 @@ async def ccs_cb(client: Client, cb: CallbackQuery):
         removed = await job_store.clear_finished(uid)
         note = f"🗑 Cleared {removed} finished/failed job(s)." if removed else "Nothing to clear."
         await cb.answer(note, show_alert=True)
-        # fall through to refresh
 
     if action in ("refresh", "clear"):
         await _ensure_poller(client)
         text = _render_panel(uid)
         try:
-            await cb.message.edit(text, parse_mode=enums.ParseMode.HTML,
-                                  reply_markup=_status_kb(uid))
+            await cb.message.edit(
+                text,
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=_status_kb(uid),
+            )
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" not in str(e):
                 raise
@@ -189,22 +218,17 @@ async def ccs_cb(client: Client, cb: CallbackQuery):
 # ─────────────────────────────────────────────────────────────
 
 async def _ensure_poller(client: Client) -> None:
-    """Start the background poller the first time it's needed."""
     global _poller_started
     if not _poller_started:
         _poller_started = True
         asyncio.create_task(_poll_loop(client))
-        log.info("[CCStatus] Background poller started (interval=%ds)", _POLL_INTERVAL)
+        log.info("[CCStatus] Background poller started")
 
 
 async def _poll_loop(client: Client) -> None:
-    """
-    Runs forever, checking all active CC jobs every _POLL_INTERVAL seconds.
-    Sends a Telegram message to the user when a job finishes or errors.
-    """
     api_key = os.environ.get("CC_API_KEY", "").strip()
     if not api_key:
-        log.warning("[CCStatus] No CC_API_KEY — poller will not check job statuses")
+        log.warning("[CCStatus] No CC_API_KEY — poller will not run")
         return
 
     log.info("[CCStatus] Poller running")
@@ -213,11 +237,22 @@ async def _poll_loop(client: Client) -> None:
             await _sweep(client, api_key)
         except Exception as exc:
             log.warning("[CCStatus] Sweep error: %s", exc)
-        await asyncio.sleep(_POLL_INTERVAL)
+
+        # Use fast interval when any job is actively encoding
+        active = job_store.all_active()
+        encoding = any(j.status == "processing" for j in active)
+        interval = _POLL_FAST if encoding else _POLL_IDLE
+        await asyncio.sleep(interval)
 
 
 async def _sweep(client: Client, api_key: str) -> None:
-    """Check all active jobs once and notify users of any state changes."""
+    """
+    Check all active jobs once.
+
+    For each job:
+      - Extract percent + message from the active task → update progress bar
+      - If status changed to finished/error → notify user
+    """
     from services.cloudconvert_api import check_job_status
 
     active = job_store.all_active()
@@ -229,29 +264,52 @@ async def _sweep(client: Client, api_key: str) -> None:
     for job in active:
         try:
             data   = await check_job_status(api_key, job.job_id)
-            status = data.get("status", "processing")
+            status = data.get("status", job.status)
 
-            if status == job.status:
-                continue   # no change
+            # ── Extract encoding progress from tasks ──────────
+            updates: dict = {}
+            processing_task = None
 
-            # ── Status changed ────────────────────────────────
-            updates: dict = {"status": status}
+            for task in data.get("tasks", []):
+                t_status = task.get("status", "")
+                t_op     = task.get("operation", "")
 
-            if status in ("finished", "error"):
-                updates["finished_at"] = time.time()
+                # Find the task that is currently encoding
+                if t_status == "processing" and t_op == "command":
+                    processing_task = task
+                    pct = float(task.get("percent") or 0)
+                    msg = task.get("message", "") or "Executing ffmpeg"
+                    updates["progress_pct"]  = pct
+                    updates["task_message"]  = msg
+                    updates["progress_at"]   = time.time()
+                    break
 
-            if status == "error":
-                # Find the first errored task and grab its message
-                for task in data.get("tasks", []):
-                    if task.get("status") == "error":
-                        updates["error_msg"] = task.get("message", "Unknown error")[:120]
-                        break
+            # ── Status change handling ────────────────────────
+            if status != job.status:
+                updates["status"] = status
 
-            await job_store.update(job.job_id, **updates)
-            log.info("[CCStatus] Job %s → %s (%s)", job.job_id, status, job.fname)
+                if status in ("finished", "error"):
+                    updates["finished_at"]   = time.time()
+                    updates["progress_pct"]  = 100.0 if status == "finished" else job.progress_pct
 
-            # ── Notify user ───────────────────────────────────
-            if not job.notified:
+                if status == "error":
+                    for task in data.get("tasks", []):
+                        if task.get("status") == "error":
+                            updates["error_msg"] = task.get("message", "Unknown error")[:120]
+                            break
+
+            # ── Apply updates ─────────────────────────────────
+            if updates:
+                await job_store.update(job.job_id, **updates)
+                log.info(
+                    "[CCStatus] Job %s  status=%s  pct=%.1f%%  msg=%s",
+                    job.job_id, updates.get("status", job.status),
+                    updates.get("progress_pct", job.progress_pct),
+                    updates.get("task_message", job.task_message),
+                )
+
+            # ── Notify user on terminal status ────────────────
+            if status in ("finished", "error") and not job.notified:
                 await _notify(client, job, status, data)
                 await job_store.update(job.job_id, notified=True)
 
@@ -260,10 +318,8 @@ async def _sweep(client: Client, api_key: str) -> None:
 
 
 async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
-    """Send a Telegram notification to the user about a job state change."""
     try:
         if status == "finished":
-            # Pull the output filename from the export task if available
             output_name = job.output_name
             for task in data.get("tasks", []):
                 if task.get("operation") == "export/url" and task.get("status") == "finished":
@@ -274,8 +330,8 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
 
             duration = ""
             if job.finished_at:
-                secs = int(job.finished_at - job.submitted_at)
-                duration = f"  ·  done in {secs//60}m {secs%60}s"
+                secs     = int(job.finished_at - job.submitted_at)
+                duration = f"  ·  done in {secs // 60}m {secs % 60}s"
 
             text = (
                 "☁️ <b>CloudConvert — Job Finished!</b>\n"
@@ -288,8 +344,8 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
                 "<i>Use /ccstatus to check all jobs.</i>"
             )
 
-        else:  # error
-            err = getattr(job, "error_msg", "") or "Unknown error"
+        else:
+            err = job.error_msg or "Unknown error"
             text = (
                 "☁️ <b>CloudConvert — Job Failed</b>\n"
                 "──────────────────────\n\n"
@@ -304,10 +360,13 @@ async def _notify(client: Client, job: CCJob, status: str, data: dict) -> None:
             job.uid, text,
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 View All Jobs", callback_data=f"ccs|refresh|{job.uid}")]
+                [InlineKeyboardButton(
+                    "📋 View All Jobs",
+                    callback_data=f"ccs|refresh|{job.uid}",
+                )]
             ]),
         )
 
     except Exception as exc:
-        log.warning("[CCStatus] Could not notify uid=%d for job %s: %s",
+        log.warning("[CCStatus] Could not notify uid=%d job %s: %s",
                     job.uid, job.job_id, exc)
