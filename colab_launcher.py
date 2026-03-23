@@ -9,8 +9,8 @@ API_HASH  = ""     # @param {type:"string"}
 BOT_TOKEN = ""     # @param {type:"string"}
 OWNER_ID  = 0      # @param {type:"integer"}
 
-FILE_LIMIT_MB = 2048   # @param {type:"integer"}
-LOG_CHANNEL   = 0      # @param {type:"integer"}
+FILE_LIMIT_MB = 2048          # @param {type:"integer"}
+LOG_CHANNEL   = "@zilong_dump" # @param {type:"string"}
 
 # CloudConvert auto-upload (optional)
 NGROK_TOKEN       = ""  # @param {type:"string"}
@@ -22,7 +22,7 @@ CC_API_KEY        = ""  # @param {type:"string"}
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
-REPO_URL = "https://github.com/vicMenma/Zilong_multiusage.git"
+REPO_URL = "https://github.com/vicMenma/Zilong_v2.git"
 BASE_DIR = "/content/zilong"
 
 
@@ -43,7 +43,22 @@ def _secret(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
-print("⚡ Zilong Bot — Colab Launcher")
+def _resolve_channel(val) -> str:
+    """
+    Return the channel value as a clean string.
+    Accepts:
+      - integer  → "123456789"
+      - "@username" → "@username"  (kept as-is for Pyrogram)
+      - "-100123456789" → "-100123456789"
+      - "" / 0   → "0"  (disabled)
+    """
+    s = str(val).strip()
+    if not s or s == "0":
+        return "0"
+    return s
+
+
+print("⚡ Zilong Bot — Colab Launcher (Zilong_v2)")
 print("─" * 50)
 _log("STEP", "Resolving credentials…")
 
@@ -58,9 +73,14 @@ if not OWNER_ID:
 if not FILE_LIMIT_MB:
     try: FILE_LIMIT_MB = int(_secret("FILE_LIMIT_MB") or 2048)
     except: FILE_LIMIT_MB = 2048
-if not LOG_CHANNEL:
-    try: LOG_CHANNEL = int(_secret("LOG_CHANNEL") or 0)
-    except: LOG_CHANNEL = 0
+
+# LOG_CHANNEL: supports @username, numeric ID, or 0 (disabled)
+if not LOG_CHANNEL or str(LOG_CHANNEL).strip() in ("", "0"):
+    _lc_raw = _secret("LOG_CHANNEL") or "0"
+    LOG_CHANNEL = _resolve_channel(_lc_raw)
+else:
+    LOG_CHANNEL = _resolve_channel(LOG_CHANNEL)
+
 if not NGROK_TOKEN:       NGROK_TOKEN       = _secret("NGROK_TOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
@@ -77,6 +97,7 @@ if errors:
     raise SystemExit("Fill in credentials and run again.")
 
 _log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
+_log("OK", f"Log channel: {LOG_CHANNEL if LOG_CHANNEL != '0' else 'disabled'}")
 if NGROK_TOKEN:
     _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
 if CC_API_KEY:
@@ -105,7 +126,7 @@ _log("STEP", "Installing Python packages…")
 # pyrofork-specific internals won't be available.
 subprocess.run(
     [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
-    capture_output=True,  # silence "not installed" warnings
+    capture_output=True,
 )
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q",
@@ -123,45 +144,49 @@ subprocess.Popen(
 time.sleep(2)
 _log("OK", "aria2c started")
 
-env_lines = [
-    f"API_ID={API_ID}",
-    f"API_HASH={API_HASH}",
-    f"BOT_TOKEN={BOT_TOKEN}",
-    f"OWNER_ID={OWNER_ID}",
-    f"FILE_LIMIT_MB={FILE_LIMIT_MB}",
-    f"LOG_CHANNEL={LOG_CHANNEL}",
-    "DOWNLOAD_DIR=/tmp/zilong_dl",
-    "ARIA2_HOST=http://localhost",
-    "ARIA2_PORT=6800",
-    "ARIA2_SECRET=",
-    # ── CloudConvert webhook ──────────────────────────────────────────────
-    f"NGROK_TOKEN={NGROK_TOKEN}",
-    f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
-    # ── CloudConvert hardsub API key ──────────────────────────────────────
-    f"CC_API_KEY={CC_API_KEY}",
-    # ── Upload speed tuning ───────────────────────────────────────────────
-    # UPLOAD_CONCURRENCY: simultaneous independent file uploads (was 1 = sequential)
-    "UPLOAD_CONCURRENCY=3",
-    # BOT_WORKERS: pyrofork dispatcher thread pool size (default 4 → 16)
-    "BOT_WORKERS=16",
-    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload (default 1 → 16)
-    # 16 parts × 512KB / ~100ms RTT ≈ 80 MB/s theoretical — real ~15-30 MB/s on Colab
-    "UPLOAD_PARTS_PARALLEL=16",
-]
-for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
-    val = _secret(optional)
-    if val:
-        env_lines.append(f"{optional}={val}")
+# ── Patch config.py to support string LOG_CHANNEL (@username / numeric) ──────
+# core/config.py defines log_channel as int via _int_env(), which silently
+# returns 0 for "@username" strings. We patch it to keep the raw string value
+# so Pyrogram can forward to both @username channels and numeric IDs.
+_log("STEP", "Patching config.py for string LOG_CHANNEL support…")
+try:
+    import re as _re
+    _cfg_path = os.path.join(BASE_DIR, "core", "config.py")
+    _cfg_src  = open(_cfg_path).read()
+    _OLD_LC = (
+        "    log_channel: int = field(default_factory=lambda:\n"
+        "        _int_env(\"LOG_CHANNEL\", 0))"
+    )
+    _NEW_LC = (
+        "    log_channel: str = field(default_factory=lambda:\n"
+        "        os.environ.get(\"LOG_CHANNEL\", \"0\").strip())"
+    )
+    if _OLD_LC in _cfg_src:
+        _cfg_src = _cfg_src.replace(_OLD_LC, _NEW_LC, 1)
+        open(_cfg_path, "w").write(_cfg_src)
+        _log("OK", "config.py patched — log_channel now accepts @username")
+    else:
+        _log("OK", "config.py patch already applied or not needed")
+except Exception as _pe:
+    _log("WARN", f"config.py patch failed (non-critical): {_pe}")
 
-with open(f"{BASE_DIR}/.env", "w") as f:
-    f.write("\n".join(env_lines))
+# ── Patch uploader.py to use log_channel as string when forwarding ────────────
+_log("STEP", "Patching uploader.py for string log_channel…")
+try:
+    _up_path = os.path.join(BASE_DIR, "services", "uploader.py")
+    _up_src  = open(_up_path).read()
+    _OLD_FWD = "        if cfg.log_channel and sent:\n            try:\n                await sent.forward(cfg.log_channel)"
+    _NEW_FWD = "        if cfg.log_channel and cfg.log_channel != \"0\" and sent:\n            try:\n                await sent.forward(cfg.log_channel)"
+    if _OLD_FWD in _up_src:
+        _up_src = _up_src.replace(_OLD_FWD, _NEW_FWD, 1)
+        open(_up_path, "w").write(_up_src)
+        _log("OK", "uploader.py patched — forward guard updated")
+    else:
+        _log("OK", "uploader.py patch already applied or not needed")
+except Exception as _upe:
+    _log("WARN", f"uploader.py patch failed (non-critical): {_upe}")
 
-for sf in glob.glob(os.path.join(BASE_DIR, "*.session*")):
-    try: os.remove(sf)
-    except OSError: pass
-
-_log("OK", "Environment configured (.env written)")
-
+# ── Apply thumbnail duration fix to uploader.py ───────────────────────────────
 _log("STEP", "Applying thumbnail duration fix to uploader.py…")
 try:
     import re as _re
@@ -169,8 +194,8 @@ try:
     _src = open(_up).read()
     _c = 0
     for _old, _new in [
-        ('"-v", "error",',                        '"-v", "quiet",'),
-        ('"-show_entries", "format=duration",',    '"-show_streams", "-show_format",'),
+        ('"-v", "error",',                               '"-v", "quiet",'),
+        ('"-show_entries", "format=duration",',          '"-show_streams", "-show_format",'),
         ('"-of", "default=noprint_wrappers=1:nokey=1",', '"-of", "json",'),
     ]:
         if _old in _src:
@@ -207,22 +232,55 @@ try:
 except Exception as _e:
     _log("WARN", f"Patch failed: {_e}")
 
+env_lines = [
+    f"API_ID={API_ID}",
+    f"API_HASH={API_HASH}",
+    f"BOT_TOKEN={BOT_TOKEN}",
+    f"OWNER_ID={OWNER_ID}",
+    f"FILE_LIMIT_MB={FILE_LIMIT_MB}",
+    f"LOG_CHANNEL={LOG_CHANNEL}",
+    "DOWNLOAD_DIR=/tmp/zilong_dl",
+    "ARIA2_HOST=http://localhost",
+    "ARIA2_PORT=6800",
+    "ARIA2_SECRET=",
+    # ── CloudConvert webhook ──────────────────────────────────────────────
+    f"NGROK_TOKEN={NGROK_TOKEN}",
+    f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
+    # ── CloudConvert hardsub API key ──────────────────────────────────────
+    f"CC_API_KEY={CC_API_KEY}",
+    # ── Upload speed tuning ───────────────────────────────────────────────
+    # UPLOAD_CONCURRENCY: 1 = sequential uploads (safe for Colab bandwidth)
+    "UPLOAD_CONCURRENCY=1",
+    # BOT_WORKERS: pyrofork dispatcher thread pool
+    "BOT_WORKERS=16",
+    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload
+    "UPLOAD_PARTS_PARALLEL=16",
+]
+for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
+    val = _secret(optional)
+    if val:
+        env_lines.append(f"{optional}={val}")
+
+with open(f"{BASE_DIR}/.env", "w") as f:
+    f.write("\n".join(env_lines))
+
+for sf in glob.glob(os.path.join(BASE_DIR, "*.session*")):
+    try: os.remove(sf)
+    except OSError: pass
+
+_log("OK", "Environment configured (.env written)")
+
 os.chdir(BASE_DIR)
 
 # ── Keep Colab alive ──────────────────────────────────────────
-# Two tricks to prevent Colab from killing the runtime:
-#   1. JavaScript: clicks the "connect" button every 60s (prevents idle disconnect)
-#   2. Heartbeat thread: prints a dot every 5 min so stdout stays active
 _log("STEP", "Activating Colab keep-alive…")
 try:
     from IPython.display import display, Javascript
     display(Javascript('''
     function ColabKeepAlive() {
-        // Try multiple selectors — Colab changes its DOM occasionally
         document.querySelector("#top-toolbar .colab-connect-button")?.click();
         document.querySelector("colab-connect-button")?.shadowRoot
             ?.querySelector("#connect")?.click();
-        // Also prevent the "runtime disconnected" dialog
         document.querySelector("#ok")?.click();
     }
     setInterval(ColabKeepAlive, 60000);
@@ -247,7 +305,7 @@ _log("OK", "Heartbeat thread started (every 5 min)")
 
 _log("OK", "Starting bot…\n" + "─" * 50)
 
-MAX_RESTARTS = 50  # only counts fast crashes (<5 min) — long-running crashes reset the counter
+MAX_RESTARTS  = 50
 restart_count = 0
 
 while restart_count < MAX_RESTARTS:
@@ -268,7 +326,7 @@ while restart_count < MAX_RESTARTS:
         _log("OK", "Bot stopped cleanly.")
         break
 
-    # If bot ran >5 min before crashing, it's not a startup bug — reset counter
+    # Long-running crash → not a startup bug, reset counter
     if elapsed > 300:
         restart_count = 0
 
