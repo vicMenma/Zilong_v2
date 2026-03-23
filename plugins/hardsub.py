@@ -114,6 +114,7 @@ async def _submit_one_job(
             subtitle_path=sub_path,
             output_name=output_name,
             scale_height=0,  # Always use original resolution
+            user_id=uid,     # Enables live upload progress in panel
         )
         return video_fname, job_id, True
     except Exception as exc:
