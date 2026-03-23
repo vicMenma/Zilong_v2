@@ -84,6 +84,8 @@ else:
     LOG_CHANNEL = _resolve_channel(LOG_CHANNEL)
 
 if not GITHUB_TOKEN: GITHUB_TOKEN = _secret("GITHUB_TOKEN")
+if not NGROK_TOKEN:
+    NGROK_TOKEN = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
 
@@ -103,6 +105,8 @@ _log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
 _log("OK", f"Log channel: {LOG_CHANNEL if LOG_CHANNEL != '0' else 'disabled'}")
 if NGROK_TOKEN:
     _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
+else:
+    _log("WARN", "NGROK_TOKEN is empty after secret resolution — webhook will be disabled")
 if CC_API_KEY:
     _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
 
@@ -175,6 +179,24 @@ try:
         _log("OK", "config.py patch already applied or not needed")
 except Exception as _pe:
     _log("WARN", f"config.py patch failed (non-critical): {_pe}")
+
+# ── Patch load_dotenv to use override=True ───────────────────────────────────
+# core/config.py calls load_dotenv() with the default override=False.
+# In Colab, stale empty env vars (e.g. NGROK_TOKEN="") from a previous
+# session survive into the subprocess environment and silently block the
+# real values from .env. override=True makes the .env file always win.
+_log("STEP", "Patching config.py load_dotenv → override=True…")
+try:
+    _cfg_path2 = os.path.join(BASE_DIR, "core", "config.py")
+    _cfg2 = open(_cfg_path2).read()
+    if "load_dotenv()" in _cfg2:
+        _cfg2 = _cfg2.replace("load_dotenv()", "load_dotenv(override=True)", 1)
+        open(_cfg_path2, "w").write(_cfg2)
+        _log("OK", "load_dotenv patched — .env always takes priority")
+    else:
+        _log("OK", "load_dotenv patch already applied or not needed")
+except Exception as _lde:
+    _log("WARN", f"load_dotenv patch failed (non-critical): {_lde}")
 
 # ── Patch uploader.py to use log_channel as string when forwarding ────────────
 _log("STEP", "Patching uploader.py for string log_channel…")
