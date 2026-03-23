@@ -4,6 +4,8 @@ CloudConvert-powered hardsubbing — batch multi-video support.
 
 Quality selection REMOVED — always uses CloudConvert default settings
 (scale_height=0 means original resolution is preserved server-side).
+
+Jobs are registered in services/cc_job_store for /ccstatus tracking.
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ def _clear(uid: int) -> None:
         cleanup(s["tmp"])
 
 
-# ── Public entry-point used by cc_buttons.py / url_handler.py ──
+# ── Public entry-point used by url_handler.py ─────────────────
 
 async def start_hardsub_for_url(
     client: "Client",
@@ -52,8 +54,6 @@ async def start_hardsub_for_url(
 ) -> None:
     """
     Start the hardsub flow with a pre-resolved direct video URL.
-    Called from url_handler.py when the user clicks the Hardsub button
-    on a URL that has already been resolved to a direct link.
     The video is NOT downloaded locally — CloudConvert fetches it by URL.
     """
     _clear(uid)
@@ -174,6 +174,20 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
         if success:
             results.append(f"✅ {i+1}. <code>{vname[:35]}</code> → <code>{result}</code>")
             ok_count += 1
+            # ── Register job in the status tracker ────────────
+            try:
+                from services.cc_job_store import CCJob, job_store
+                name_base   = os.path.splitext(vname)[0]
+                output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + " [VOSTFR].mp4"
+                asyncio.create_task(job_store.add(CCJob(
+                    job_id=result,
+                    uid=uid,
+                    fname=vname,
+                    sub_fname=sub_fname,
+                    output_name=output_name,
+                )))
+            except Exception as _jse:
+                log.warning("[Hardsub] Job store registration failed: %s", _jse)
         else:
             results.append(f"❌ {i+1}. <code>{vname[:35]}</code> — {result}")
 
@@ -186,7 +200,8 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
         f"💬 <code>{sub_fname[:38]}</code>\n"
         f"{key_info}\n\n"
         "⏳ <i>CloudConvert is processing…\n"
-        "The webhook will auto-upload results to this chat.</i>",
+        "The webhook will auto-upload results to this chat.\n"
+        "Use /ccstatus to track progress.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -368,7 +383,8 @@ async def hardsub_video_file(client: Client, msg: Message):
         ["start", "help", "settings", "info", "status", "log", "restart",
          "broadcast", "admin", "ban_user", "unban_user", "banned_list",
          "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
-         "hardsub", "stream", "forward", "createarchive", "archiveddone", "mergedone"]
+         "hardsub", "stream", "forward", "createarchive", "archiveddone",
+         "mergedone", "ccstatus"]
     ),
     group=1,
 )
@@ -481,7 +497,6 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    # Go straight to batch submission — no resolution picker
     await _submit_batch(st, state, uid)
     msg.stop_propagation()
 
@@ -547,5 +562,4 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
         _clear(uid)
         return
 
-    # Go straight to batch submission — no resolution picker
     await _submit_batch(st, state, uid)
