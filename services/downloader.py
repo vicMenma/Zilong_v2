@@ -6,10 +6,14 @@ FIXES:
 - CRITICAL: timeout variable was computed but then discarded — always used
   TOTAL_TIMEOUT (6h). Dead magnets now properly time out after 3 minutes.
 - urllib.parse moved to module-level (was duplicated as two local aliases)
+- Direct URL downloads now fall back to pure aiohttp if aria2c is not
+  running — fixes [Errno 2] on AWS when the aria2 service is stopped,
+  and works on Koyeb where aria2c is never available.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import time
@@ -23,6 +27,8 @@ import yt_dlp
 
 from core.config import cfg
 from services.utils import largest_file
+
+log = logging.getLogger(__name__)
 
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
 
@@ -58,7 +64,7 @@ def classify(url: str) -> str:
     return "direct"
 
 
-# ── Direct HTTP ───────────────────────────────────────────────
+# ── Direct HTTP (pure aiohttp — no external dependencies) ─────
 
 async def download_direct(
     url: str, dest: str, progress: Optional[ProgressCB] = None
@@ -400,9 +406,6 @@ async def download_aria2(
                 )
                 _wake(task_record.user_id)
 
-    # FIX: use the correct timeout per phase.
-    # Magnets: META_TIMEOUT (3 min) — if no progress in 3 min, magnet is dead.
-    # Everything else: TOTAL_TIMEOUT (6 h).
     timeout = META_TIMEOUT if (task_record is not None and not is_file) else TOTAL_TIMEOUT
 
     try:
@@ -526,6 +529,20 @@ async def _dispatch(
     if kind == "ytdlp":
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
-    return await download_aria2(
-        url, dest, is_file=False, progress=progress, task_record=task_record,
-    )
+
+    # ── Direct HTTP — try aria2c first, fall back to aiohttp ──
+    # Fixes [Errno 2] on AWS when the aria2 systemd service is not running,
+    # and works on Koyeb/Colab where aria2c may not always be available.
+    try:
+        return await download_aria2(
+            url, dest, is_file=False,
+            progress=progress, task_record=task_record,
+        )
+    except Exception as aria_exc:
+        log.warning(
+            "[Downloader] aria2c failed for direct URL (%s) — "
+            "falling back to aiohttp", aria_exc,
+        )
+        if task_record is not None:
+            task_record.update(engine="direct", state="📥 Downloading (fallback)…")
+        return await download_direct(url, dest, progress=progress)
