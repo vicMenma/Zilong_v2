@@ -1,11 +1,9 @@
 """
 plugins/hardsub.py
-CloudConvert-powered hardsubbing with batch + per-video resolution.
+CloudConvert-powered hardsubbing — batch multi-video support.
 
-FIXES:
-- Added start_hardsub_for_url() — was imported by cc_buttons.py but never defined (crash)
-- Wrong file type sent during waiting_subtitle now sends error + stops propagation
-  instead of silently falling through to media_router
+Quality selection REMOVED — always uses CloudConvert default settings
+(scale_height=0 means original resolution is preserved server-side).
 """
 from __future__ import annotations
 
@@ -43,7 +41,7 @@ def _clear(uid: int) -> None:
         cleanup(s["tmp"])
 
 
-# ── Public entry-point used by cc_buttons.py ─────────────────
+# ── Public entry-point used by cc_buttons.py / url_handler.py ──
 
 async def start_hardsub_for_url(
     client: "Client",
@@ -54,26 +52,25 @@ async def start_hardsub_for_url(
 ) -> None:
     """
     Start the hardsub flow with a pre-resolved direct video URL.
-    Called from cc_buttons.py when the user clicks the Hardsub button
-    on a URL that cc_buttons has already resolved to a direct link.
+    Called from url_handler.py when the user clicks the Hardsub button
+    on a URL that has already been resolved to a direct link.
     The video is NOT downloaded locally — CloudConvert fetches it by URL.
     """
     _clear(uid)
     tmp = make_tmp(cfg.download_dir, uid)
     _STATE[uid] = {
-        "step":     "waiting_subtitle",
-        "tmp":      tmp,
-        "videos":   [{"path": None, "url": url, "fname": fname, "resolution": 0}],
-        "sub_path": None,
+        "step":      "waiting_subtitle",
+        "tmp":       tmp,
+        "videos":    [{"path": None, "url": url, "fname": fname}],
+        "sub_path":  None,
         "sub_fname": None,
-        "_res_idx": 0,
     }
     await safe_edit(
         st,
         "🔥 <b>Hardsub</b>\n"
         "──────────────────────\n\n"
         f"🎬 <code>{fname[:45]}</code>\n"
-        "☁️ <i>CloudConvert will fetch directly</i>\n\n"
+        "☁️ <i>CloudConvert will fetch the video directly</i>\n\n"
         "Now send the <b>subtitle</b>:\n"
         "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
         "• A <b>URL</b> to a subtitle file\n\n"
@@ -86,41 +83,28 @@ async def start_hardsub_for_url(
 
 def _more_or_done_kb(uid: int, count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add another video",     callback_data=f"hs_more|{uid}"),
+        [InlineKeyboardButton("➕ Add another video",      callback_data=f"hs_more|{uid}"),
          InlineKeyboardButton(f"✅ Done ({count}) → Sub",  callback_data=f"hs_done|{uid}")],
         [InlineKeyboardButton("❌ Cancel",                  callback_data=f"hs_cancel|{uid}")],
     ])
 
 
-def _res_kb(uid: int, vid_idx: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Original",  callback_data=f"hs_res|0|{vid_idx}|{uid}"),
-         InlineKeyboardButton("🔵 1080p",     callback_data=f"hs_res|1080|{vid_idx}|{uid}")],
-        [InlineKeyboardButton("🟢 720p",      callback_data=f"hs_res|720|{vid_idx}|{uid}"),
-         InlineKeyboardButton("🟡 480p",      callback_data=f"hs_res|480|{vid_idx}|{uid}")],
-        [InlineKeyboardButton("🟠 360p",      callback_data=f"hs_res|360|{vid_idx}|{uid}"),
-         InlineKeyboardButton("❌ Cancel",     callback_data=f"hs_res|cancel|{vid_idx}|{uid}")],
-    ])
-
-
-def _res_label(h: int) -> str:
-    return f"{h}p" if h else "Original"
-
-
 # ─────────────────────────────────────────────────────────────
-# Submit one hardsub job
+# Submit one hardsub job (always original resolution)
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_one_job(
-    api_key: str, video: dict, sub_path: str, sub_fname: str, uid: int,
+    api_key: str,
+    video: dict,
+    sub_path: str,
+    sub_fname: str,
+    uid: int,
 ) -> tuple[str, str, bool]:
     from services.cloudconvert_api import submit_hardsub
 
-    video_fname  = video.get("fname", "video.mkv")
-    scale_height = video.get("resolution", 0)
-    name_base    = os.path.splitext(video_fname)[0]
-    res_tag      = f" [{scale_height}p VOSTFR]" if scale_height else " [VOSTFR]"
-    output_name  = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + f"{res_tag}.mp4"
+    video_fname = video.get("fname", "video.mkv")
+    name_base   = os.path.splitext(video_fname)[0]
+    output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + " [VOSTFR].mp4"
 
     try:
         job_id = await submit_hardsub(
@@ -129,7 +113,7 @@ async def _submit_one_job(
             video_url=video.get("url"),
             subtitle_path=sub_path,
             output_name=output_name,
-            scale_height=scale_height,
+            scale_height=0,  # Always use original resolution
         )
         return video_fname, job_id, True
     except Exception as exc:
@@ -148,15 +132,16 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
     count     = len(videos)
 
     vid_list = "\n".join(
-        f"  {i+1}. <code>{v['fname'][:35]}</code> → <b>{_res_label(v.get('resolution', 0))}</b>"
+        f"  {i+1}. <code>{v['fname'][:40]}</code>"
         for i, v in enumerate(videos)
     )
-    await safe_edit(st,
+    await safe_edit(
+        st,
         f"☁️ <b>Submitting {count} hardsub job{'s' if count > 1 else ''}…</b>\n"
         "──────────────────────\n\n"
         f"{vid_list}\n\n"
         f"💬 <code>{sub_fname[:42]}</code>\n\n"
-        "<i>Checking API keys and creating jobs…</i>",
+        "<i>Checking API key and creating jobs…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -171,7 +156,8 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
         else:
             key_info = "🔑 1 API key"
     except Exception as exc:
-        await safe_edit(st,
+        await safe_edit(
+            st,
             f"❌ <b>All API keys exhausted</b>\n\n<code>{str(exc)[:200]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
@@ -185,15 +171,15 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
         vname, result, success = await _submit_one_job(
             api_key, video, sub_path, sub_fname, uid,
         )
-        res = _res_label(video.get("resolution", 0))
         if success:
-            results.append(f"✅ {i+1}. <code>{vname[:30]}</code> [{res}] → <code>{result}</code>")
+            results.append(f"✅ {i+1}. <code>{vname[:35]}</code> → <code>{result}</code>")
             ok_count += 1
         else:
-            results.append(f"❌ {i+1}. <code>{vname[:30]}</code> [{res}] — {result}")
+            results.append(f"❌ {i+1}. <code>{vname[:35]}</code> — {result}")
 
     result_text = "\n".join(results)
-    await safe_edit(st,
+    await safe_edit(
+        st,
         f"{'✅' if ok_count == count else '⚠️'} <b>Hardsub — {ok_count}/{count} submitted</b>\n"
         "──────────────────────\n\n"
         f"{result_text}\n\n"
@@ -209,45 +195,6 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Show resolution picker for video N
-# ─────────────────────────────────────────────────────────────
-
-async def _ask_resolution_for(st, state: dict, uid: int) -> None:
-    videos = state.get("videos", [])
-    idx    = state.get("_res_idx", 0)
-    count  = len(videos)
-
-    if idx >= count:
-        await _submit_batch(st, state, uid)
-        return
-
-    state["step"] = "waiting_resolution"
-    video     = videos[idx]
-    sub_fname = state.get("sub_fname", "subtitle.ass")
-
-    lines = []
-    for i, v in enumerate(videos):
-        fname_s = v["fname"][:35]
-        if i < idx:
-            res = _res_label(v.get("resolution", 0))
-            lines.append(f"  ✅ {i+1}. <code>{fname_s}</code> → <b>{res}</b>")
-        elif i == idx:
-            lines.append(f"  👉 {i+1}. <code>{fname_s}</code> → <b>?</b>")
-        else:
-            lines.append(f"  ⏳ {i+1}. <code>{fname_s}</code>")
-
-    await safe_edit(st,
-        f"📐 <b>Resolution — Video {idx+1}/{count}</b>\n"
-        "──────────────────────\n\n"
-        + "\n".join(lines) + "\n\n"
-        f"💬 <code>{sub_fname[:42]}</code>\n\n"
-        f"Choose resolution for <b>{video['fname'][:40]}</b>:",
-        parse_mode=enums.ParseMode.HTML,
-        reply_markup=_res_kb(uid, idx),
-    )
-
-
-# ─────────────────────────────────────────────────────────────
 # Helper: video added to batch
 # ─────────────────────────────────────────────────────────────
 
@@ -258,7 +205,8 @@ async def _video_added(msg_or_st, state: dict, uid: int, fname: str) -> None:
         f"  {i+1}. <code>{v['fname'][:40]}</code>"
         for i, v in enumerate(videos)
     )
-    await safe_edit(msg_or_st,
+    await safe_edit(
+        msg_or_st,
         f"✅ <b>Video {count} added!</b>\n"
         "──────────────────────\n\n"
         f"{vid_list}\n\n"
@@ -289,12 +237,11 @@ async def cmd_hardsub(client: Client, msg: Message):
     _clear(uid)
     tmp = make_tmp(cfg.download_dir, uid)
     _STATE[uid] = {
-        "step":     "waiting_video",
-        "tmp":      tmp,
-        "videos":   [],
-        "sub_path": None,
+        "step":      "waiting_video",
+        "tmp":       tmp,
+        "videos":    [],
+        "sub_path":  None,
         "sub_fname": None,
-        "_res_idx": 0,
     }
 
     await msg.reply(
@@ -305,7 +252,7 @@ async def cmd_hardsub(client: Client, msg: Message):
         "• A <b>direct URL</b> (HTTP link to .mkv/.mp4)\n"
         "• A <b>magnet link</b> (downloaded via aria2 first)\n\n"
         "📦 <i>You can send multiple videos — they'll all get\n"
-        "the same subtitle burned in (each with its own resolution).</i>\n\n"
+        "the same subtitle burned in.</i>\n\n"
         "<i>Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
@@ -384,7 +331,8 @@ async def hardsub_video_file(client: Client, msg: Message):
     fname = getattr(media, "file_name", None) or "video.mkv"
     ext   = os.path.splitext(fname)[1].lower()
 
-    _VIDEO_EXTS = {".mp4",".mkv",".avi",".mov",".webm",".flv",".ts",".m2ts",".wmv",".m4v"}
+    _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv",
+                   ".ts", ".m2ts", ".wmv", ".m4v"}
     if ext not in _VIDEO_EXTS and not msg.video:
         return
 
@@ -402,8 +350,9 @@ async def hardsub_video_file(client: Client, msg: Message):
             fname=fname, fsize=fsize, user_id=uid,
         )
         state["videos"].append({
-            "path": path, "url": None,
-            "fname": os.path.basename(path), "resolution": 0,
+            "path":  path,
+            "url":   None,
+            "fname": os.path.basename(path),
         })
         await _video_added(st, state, uid, fname)
     except Exception as exc:
@@ -416,10 +365,10 @@ async def hardsub_video_file(client: Client, msg: Message):
 # Step 1: Receive video URL / magnet / subtitle URL
 @Client.on_message(
     filters.private & filters.text & ~filters.command(
-        ["start","help","settings","info","status","log","restart",
-         "broadcast","admin","ban_user","unban_user","banned_list",
-         "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
-         "hardsub","stream","forward","createarchive","archiveddone","mergedone"]
+        ["start", "help", "settings", "info", "status", "log", "restart",
+         "broadcast", "admin", "ban_user", "unban_user", "banned_list",
+         "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
+         "hardsub", "stream", "forward", "createarchive", "archiveddone", "mergedone"]
     ),
     group=1,
 )
@@ -449,10 +398,7 @@ async def hardsub_url_handler(client: Client, msg: Message):
     if kind == "direct":
         raw_name = text.split("/")[-1].split("?")[0]
         fname    = _urlparse.unquote_plus(raw_name)[:50] or "video.mkv"
-        state["videos"].append({
-            "path": None, "url": text,
-            "fname": fname, "resolution": 0,
-        })
+        state["videos"].append({"path": None, "url": text, "fname": fname})
         st = await msg.reply(
             f"✅ Video URL added: <code>{fname[:40]}</code>\n"
             "☁️ <i>CloudConvert will fetch directly</i>",
@@ -479,10 +425,7 @@ async def hardsub_url_handler(client: Client, msg: Message):
             if not os.path.isfile(path):
                 raise FileNotFoundError("No output file found")
             fname = os.path.basename(path)
-            state["videos"].append({
-                "path": path, "url": None,
-                "fname": fname, "resolution": 0,
-            })
+            state["videos"].append({"path": path, "url": None, "fname": fname})
             await _video_added(st, state, uid, fname)
         except Exception as exc:
             await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
@@ -513,8 +456,6 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
     ext   = os.path.splitext(fname)[1].lower()
 
     if ext not in _SUB_EXTS:
-        # FIX: send a clear error and stop propagation so this doesn't
-        # fall through to media_router and open a new video session
         await msg.reply(
             f"❌ <b>Unsupported file type</b>: <code>{ext or 'unknown'}</code>\n\n"
             "Please send a subtitle file:\n"
@@ -540,8 +481,8 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    state["_res_idx"] = 0
-    await _ask_resolution_for(st, state, uid)
+    # Go straight to batch submission — no resolution picker
+    await _submit_batch(st, state, uid)
     msg.stop_propagation()
 
 
@@ -584,8 +525,7 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
                 content = await resp.read()
 
         if len(content) > 10_000_000:
-            await safe_edit(st, "❌ File too large — not a subtitle.",
-                            parse_mode=enums.ParseMode.HTML)
+            await safe_edit(st, "❌ File too large — not a subtitle.")
             _clear(uid)
             return
 
@@ -599,47 +539,13 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
 
     except Exception as exc:
         log.error("[Hardsub] Subtitle URL failed: %s", exc)
-        await safe_edit(st,
+        await safe_edit(
+            st,
             f"❌ Subtitle download failed:\n<code>{str(exc)[:200]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
         _clear(uid)
         return
 
-    state["_res_idx"] = 0
-    await _ask_resolution_for(st, state, uid)
-
-
-# ─────────────────────────────────────────────────────────────
-# Step 3: Resolution picker  hs_res|<h>|<vid_idx>|<uid>
-# ─────────────────────────────────────────────────────────────
-
-@Client.on_callback_query(filters.regex(r"^hs_res\|"))
-async def hardsub_resolution_cb(client: Client, cb: CallbackQuery):
-    parts = cb.data.split("|")
-    if len(parts) < 4:
-        return await cb.answer("Invalid data.", show_alert=True)
-    _, height_str, vid_idx_str, uid_str = parts[:4]
-    uid   = int(uid_str) if uid_str.isdigit() else cb.from_user.id
-    state = _user_state(uid)
-
-    if not state or state["step"] != "waiting_resolution":
-        return await cb.answer("Session expired. Use /hardsub again.", show_alert=True)
-    await cb.answer()
-
-    if height_str == "cancel":
-        _clear(uid)
-        await cb.message.delete()
-        return
-
-    vid_idx      = int(vid_idx_str) if vid_idx_str.isdigit() else 0
-    scale_height = int(height_str) if height_str.isdigit() else 0
-    videos       = state.get("videos", [])
-    if vid_idx < len(videos):
-        videos[vid_idx]["resolution"] = scale_height
-
-    state["_res_idx"] = vid_idx + 1
-    if state["_res_idx"] >= len(videos):
-        await _submit_batch(cb.message, state, uid)
-    else:
-        await _ask_resolution_for(cb.message, state, uid)
+    # Go straight to batch submission — no resolution picker
+    await _submit_batch(st, state, uid)
