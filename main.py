@@ -62,9 +62,21 @@ def build_client() -> Client:
         kwargs["workers"] = _WORKERS
         log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
     if "max_concurrent_transmissions" in sig.parameters:
-        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
+        # FIX: raised default from 8 → 16 so running main.py directly
+        # (without colab_launcher) gets full parallel upload streams too.
+        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "16"))
         kwargs["max_concurrent_transmissions"] = ct
         log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", ct)
+    # FIX: sleep_threshold — avoid stalling on transient MTProto flood waits.
+    if "sleep_threshold" in sig.parameters:
+        kwargs["sleep_threshold"] = 60
+        log.info("⏱  sleep_threshold=60s")
+    # FIX: force IPv4 unless explicitly overridden — Colab's IPv6 routing
+    # can add latency to Telegram DCs. Set USE_IPV6=1 in env to re-enable.
+    if "ipv6" in sig.parameters:
+        ipv6 = os.environ.get("USE_IPV6", "0").strip() == "1"
+        kwargs["ipv6"] = ipv6
+        log.info("🌐 ipv6=%s", ipv6)
     return Client(**kwargs)
 
 

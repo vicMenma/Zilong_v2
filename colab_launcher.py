@@ -143,7 +143,14 @@ subprocess.run(
      "-r", f"{BASE_DIR}/requirements.txt"],
     check=True,
 )
-_log("OK", "Python packages installed")
+# FIX: install uvloop for high-performance async I/O.
+# Without it, main.py falls back to the default asyncio event loop which
+# is 2-4x slower for MTProto upload throughput on Colab.
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "uvloop"],
+    capture_output=True,
+)
+_log("OK", "Python packages installed (uvloop included)")
 
 _log("STEP", "Starting aria2c daemon…")
 subprocess.Popen(
@@ -277,8 +284,10 @@ env_lines = [
     # ── CloudConvert hardsub API key ──────────────────────────────────────
     f"CC_API_KEY={CC_API_KEY}",
     # ── Upload speed tuning ───────────────────────────────────────────────
-    # UPLOAD_CONCURRENCY: 1 = sequential uploads (safe for Colab bandwidth)
-    "UPLOAD_CONCURRENCY=1",
+    # UPLOAD_CONCURRENCY: raised 1 → 2 to allow two files uploading in
+    # parallel, doubling effective throughput on Colab without overloading
+    # the shared NIC. Keep at 1 if you notice dropped connections.
+    "UPLOAD_CONCURRENCY=2",
     # BOT_WORKERS: pyrofork dispatcher thread pool
     "BOT_WORKERS=16",
     # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload
@@ -358,7 +367,7 @@ while restart_count < MAX_RESTARTS:
         "ARIA2_HOST":           "http://localhost",
         "ARIA2_PORT":           "6800",
         "ARIA2_SECRET":         "",
-        "UPLOAD_CONCURRENCY":   "1",
+        "UPLOAD_CONCURRENCY":   "2",
         "BOT_WORKERS":          "16",
         "UPLOAD_PARTS_PARALLEL":"16",
     }
