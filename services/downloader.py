@@ -72,7 +72,14 @@ async def download_direct(
     headers = {"User-Agent": "Mozilla/5.0"}
     start   = time.time()
 
-    async with aiohttp.ClientSession(headers=headers) as sess:
+    # FIX: tune the TCP connector to avoid repeated connection setup and
+    # stale-socket churn on Colab's shared network stack.
+    connector = aiohttp.TCPConnector(
+        limit=32,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True,
+    )
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as sess:
         async with sess.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", 0))
@@ -203,7 +210,13 @@ async def download_ytdlp(
 async def download_mediafire(
     url: str, dest: str, progress: Optional[ProgressCB] = None
 ) -> str:
-    async with aiohttp.ClientSession() as sess:
+    # FIX: use a tuned connector instead of a bare ClientSession.
+    connector = aiohttp.TCPConnector(
+        limit=32,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True,
+    )
+    async with aiohttp.ClientSession(connector=connector) as sess:
         async with sess.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             html = await resp.text()
 
